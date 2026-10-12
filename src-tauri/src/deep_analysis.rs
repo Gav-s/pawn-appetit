@@ -4,7 +4,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use shakmaty::{fen::Fen, uci::UciMove, CastlingMode, Chess, Color, EnPassantMode, Position};
 use specta::Type;
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -643,10 +646,15 @@ fn parse_line(text: &str, fen: &str, history: &[String]) -> Option<DeepAnalysisL
 
 #[derive(Default)]
 pub struct DeepAnalysisState {
-    active: Arc<Mutex<Option<String>>>,
+    active: Arc<Mutex<Option<ActiveWorker>>>,
+}
+struct ActiveWorker {
+    project_id: String,
+    cancelled: Arc<AtomicBool>,
 }
 struct WorkerLease {
-    active: Arc<Mutex<Option<String>>>,
+    active: Arc<Mutex<Option<ActiveWorker>>>,
+    cancelled: Arc<AtomicBool>,
 }
 impl Drop for WorkerLease {
     fn drop(&mut self) {
@@ -654,12 +662,28 @@ impl Drop for WorkerLease {
     }
 }
 impl DeepAnalysisState {
+    fn pause(&self, store: &Store, project_id: &str) -> Result<(), String> {
+        let active = self.active.lock().map_err(|e| e.to_string())?;
+        store.pause(project_id)?;
+        if let Some(worker) = active.as_ref().filter(|w| w.project_id == project_id) {
+            worker.cancelled.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+    fn cancel(&self, store: &Store, project_id: &str) -> Result<(), String> {
+        let active = self.active.lock().map_err(|e| e.to_string())?;
+        store.cancel(project_id)?;
+        if let Some(worker) = active.as_ref().filter(|w| w.project_id == project_id) {
+            worker.cancelled.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
     async fn acquire_after_drain(&self, project_id: &str) -> Result<WorkerLease, String> {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 {
                     let active = self.active.lock().map_err(|e| e.to_string())?;
-                    if active.as_deref().is_some_and(|id| id != project_id) {
+                    if active.as_ref().is_some_and(|w| w.project_id != project_id) {
                         return Err("another deep analysis project is active".into());
                     }
                 }
@@ -677,9 +701,14 @@ impl DeepAnalysisState {
         if active.is_some() {
             return Err("deep analysis worker already active".into());
         }
-        *active = Some(project_id.to_owned());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        *active = Some(ActiveWorker {
+            project_id: project_id.to_owned(),
+            cancelled: cancelled.clone(),
+        });
         Ok(WorkerLease {
             active: self.active.clone(),
+            cancelled,
         })
     }
 }
@@ -756,7 +785,7 @@ pub fn queue_deep_analysis_continuation(
 #[specta::specta]
 pub fn pause_deep_analysis(app: tauri::AppHandle, project_id: String) -> Result<(), String> {
     let s = store(&app)?;
-    s.pause(&project_id)?;
+    app.state::<DeepAnalysisState>().pause(&s, &project_id)?;
     let _ = DeepAnalysisProgress::emit(&s.progress(&project_id, None, None)?, &app);
     Ok(())
 }
@@ -764,7 +793,7 @@ pub fn pause_deep_analysis(app: tauri::AppHandle, project_id: String) -> Result<
 #[specta::specta]
 pub fn cancel_deep_analysis(app: tauri::AppHandle, project_id: String) -> Result<(), String> {
     let s = store(&app)?;
-    s.cancel(&project_id)?;
+    app.state::<DeepAnalysisState>().cancel(&s, &project_id)?;
     let _ = DeepAnalysisProgress::emit(&s.progress(&project_id, None, None)?, &app);
     Ok(())
 }
@@ -815,8 +844,9 @@ async fn launch(
     }
     s.begin_running(&project_id, &initial_status)?;
     tauri::async_runtime::spawn(async move {
+        let cancelled = lease.cancelled.clone();
         let _lease = lease;
-        if let Err(e) = run_worker(&app, &project_id).await {
+        if let Err(e) = run_worker(&app, &project_id, &cancelled).await {
             log::error!("Deep analysis worker {}: {}", project_id, e);
             if let Ok(s) = store(&app) {
                 let _ = s.fail_worker(&project_id, &e);
@@ -828,13 +858,20 @@ async fn launch(
     });
     Ok(())
 }
-async fn run_worker(app: &tauri::AppHandle, project_id: &str) -> Result<(), String> {
+async fn run_worker(
+    app: &tauri::AppHandle,
+    project_id: &str,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
     let s = store(app)?;
     loop {
-        if s.status(project_id)? != "running" {
+        if cancelled.load(Ordering::Acquire) || s.status(project_id)? != "running" {
             break;
         }
         let Some(task) = s.claim(project_id)? else {
+            if cancelled.load(Ordering::Acquire) {
+                break;
+            }
             if !s.finish(project_id)? {
                 continue; // Queue won the race after claim returned None.
             }
@@ -842,15 +879,15 @@ async fn run_worker(app: &tauri::AppHandle, project_id: &str) -> Result<(), Stri
             break;
         };
         let project = s.get_project(project_id)?.ok_or("project not found")?;
-        let outcome = analyze_position(&project, &task, &s).await;
-        if s.status(project_id)? != "running" {
+        let outcome = analyze_position(&project, &task, &s, cancelled).await;
+        if cancelled.load(Ordering::Acquire) || s.status(project_id)? != "running" {
             s.requeue(&task.id)?;
             break;
         }
         match outcome {
             Ok(lines) => {
                 if let Err(e) = s.save(&task.id, &lines) {
-                    if s.status(project_id)? != "running" {
+                    if cancelled.load(Ordering::Acquire) || s.status(project_id)? != "running" {
                         s.requeue(&task.id)?;
                         break;
                     }
@@ -879,6 +916,7 @@ async fn analyze_position(
     project: &DeepAnalysisProject,
     task: &DeepAnalysisTask,
     s: &Store,
+    cancelled: &AtomicBool,
 ) -> Result<Vec<DeepAnalysisLine>, String> {
     // Dropping a pending handshake kills its child (UciCommunicator uses kill_on_drop).
     let handshake = EngineProcess::new(PathBuf::from(&project.engine));
@@ -887,13 +925,13 @@ async fn analyze_position(
         tokio::select! {
             result = &mut handshake => break result.map_err(|e| e.to_string())?,
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                if s.status(&project.id)? != "running" {
+                if cancelled.load(Ordering::Acquire) || s.status(&project.id)? != "running" {
                     return Err("interrupted".into());
                 }
             }
         }
     };
-    if s.status(&project.id)? != "running" {
+    if cancelled.load(Ordering::Acquire) || s.status(&project.id)? != "running" {
         let _ = engine.kill().await;
         return Err("interrupted".into());
     }
@@ -916,7 +954,7 @@ async fn analyze_position(
         let mut best = std::collections::BTreeMap::<u16, DeepAnalysisLine>::new();
         loop {
             let next = tokio::time::timeout(Duration::from_millis(100), reader.next_line()).await;
-            if s.status(&project.id)? != "running" {
+            if cancelled.load(Ordering::Acquire) || s.status(&project.id)? != "running" {
                 let _ = engine.stop().await;
                 return Err("interrupted".into());
             }
@@ -1240,7 +1278,10 @@ mod tests {
             drop(old);
         });
         let next = state.acquire_after_drain("first").await.unwrap();
-        assert_eq!(copy.lock().unwrap().as_deref(), Some("first"));
+        assert_eq!(
+            copy.lock().unwrap().as_ref().map(|w| w.project_id.as_str()),
+            Some("first")
+        );
         drop(next);
         assert!(state.acquire("other").is_ok());
     }
@@ -1443,7 +1484,13 @@ mod tests {
         let path = s.path.clone();
         let project = p.clone();
         let search = tokio::spawn(async move {
-            analyze_position(&project, &task, &Store::open(&path).unwrap()).await
+            analyze_position(
+                &project,
+                &task,
+                &Store::open(&path).unwrap(),
+                &AtomicBool::new(false),
+            )
+            .await
         });
         tokio::time::timeout(Duration::from_secs(2), async {
             while !received.exists() {
@@ -1486,8 +1533,9 @@ mod tests {
         let other = Store::open(&path).unwrap();
         let project = p.clone();
         let running_task = task.clone();
-        let search =
-            tokio::spawn(async move { analyze_position(&project, &running_task, &other).await });
+        let search = tokio::spawn(async move {
+            analyze_position(&project, &running_task, &other, &AtomicBool::new(false)).await
+        });
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if !s.results(&p.id).unwrap().is_empty() {
@@ -1545,7 +1593,9 @@ mod tests {
         let task = s.claim(&p.id).unwrap().unwrap();
         let other = Store::open(&path).unwrap();
         let project = p.clone();
-        let search = tokio::spawn(async move { analyze_position(&project, &task, &other).await });
+        let search = tokio::spawn(async move {
+            analyze_position(&project, &task, &other, &AtomicBool::new(false)).await
+        });
         tokio::time::timeout(Duration::from_secs(3), async {
             while s.results(&p.id).unwrap().is_empty() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1573,6 +1623,60 @@ mod tests {
     }
     #[cfg(unix)]
     #[tokio::test]
+    async fn immediate_resume_does_not_let_old_search_continue() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("waiting.sh");
+        let started = dir.path().join("started");
+        let stopped = dir.path().join("stopped");
+        std::fs::write(
+            &engine,
+            format!(
+                "#!/bin/sh\nwhile read line; do\n case \"$line\" in\n uci) echo uciok;;\n isready) echo readyok;;\n go*) touch '{}';;\n stop) touch '{}'; echo 'bestmove e2e4';;\n quit) exit 0;;\n esac\ndone\n",
+                started.display(), stopped.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let p = s
+            .create_project("race", engine.to_str().unwrap(), 1000, 1, &start_fen(), &[])
+            .unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let task = s.claim(&p.id).unwrap().unwrap();
+        let state = DeepAnalysisState::default();
+        let lease = state.acquire(&p.id).unwrap();
+        let other = Store::open(&s.path).unwrap();
+        let project = p.clone();
+        let cancelled = lease.cancelled.clone();
+        let search =
+            tokio::spawn(
+                async move { analyze_position(&project, &task, &other, &cancelled).await },
+            );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        state.pause(&s, &p.id).unwrap();
+        // Recreate the status transition before the old worker's next poll.
+        s.begin_running(&p.id, "paused").unwrap();
+        assert!(
+            state.acquire(&p.id).is_err(),
+            "new worker must wait for old lease"
+        );
+        assert!(tokio::time::timeout(Duration::from_secs(2), search)
+            .await
+            .expect("old search must stop despite running status")
+            .unwrap()
+            .is_err());
+        assert!(stopped.exists(), "old UCI search must receive stop");
+        drop(lease);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
     async fn engine_exit_after_scored_pv_leaves_task_failed_not_completed() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -1592,7 +1696,9 @@ mod tests {
             .unwrap();
         s.begin_running(&p.id, "paused").unwrap();
         let task = s.claim(&p.id).unwrap().unwrap();
-        let err = analyze_position(&p, &task, &s).await.unwrap_err();
+        let err = analyze_position(&p, &task, &s, &AtomicBool::new(false))
+            .await
+            .unwrap_err();
         s.fail(&task.id, &err).unwrap();
         assert_eq!(s.list_tasks(&p.id).unwrap()[0].status, "failed");
         assert_eq!(s.progress(&p.id, None, None).unwrap().completed, 0);
@@ -1613,7 +1719,9 @@ mod tests {
         let task = s.list_tasks(&p.id).unwrap().remove(0);
         s.set_status(&p.id, "running").unwrap();
         s.claim(&p.id).unwrap();
-        let lines = analyze_position(&p, &task, &s).await.unwrap();
+        let lines = analyze_position(&p, &task, &s, &AtomicBool::new(false))
+            .await
+            .unwrap();
         s.save(&task.id, &lines).unwrap();
         assert_eq!(
             s.results(&p.id).unwrap()[0].lines[0].uci_moves,
