@@ -35,7 +35,8 @@ impl UciCommunicator {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
         #[cfg(target_os = "windows")]
         command.creation_flags(super::process::CREATE_NO_WINDOW);

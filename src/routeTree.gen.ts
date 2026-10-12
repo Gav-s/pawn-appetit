@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AccountsRouteImport } from './routes/accounts'
 import { Route as BoardsRouteImport } from './routes/boards'
+import { Route as DeepAnalysisRouteImport } from './routes/deep-analysis'
 import { Route as EnginesRouteImport } from './routes/engines'
 import { Route as FilesRouteImport } from './routes/files'
 import { Route as SettingsRouteRouteImport } from './routes/settings/route'
@@ -36,6 +37,11 @@ const AccountsRoute = AccountsRouteImport.update({
 const BoardsRoute = BoardsRouteImport.update({
   id: '/boards',
   path: '/boards',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const DeepAnalysisRoute = DeepAnalysisRouteImport.update({
+  id: '/deep-analysis',
+  path: '/deep-analysis',
   getParentRoute: () => rootRouteImport,
 } as any)
 const EnginesRoute = EnginesRouteImport.update({
@@ -96,6 +102,7 @@ export interface FileRoutesByFullPath {
   '/train': typeof TrainRouteRouteWithChildren
   '/accounts': typeof AccountsRoute
   '/boards': typeof BoardsRoute
+  '/deep-analysis': typeof DeepAnalysisRoute
   '/engines': typeof EnginesRoute
   '/files': typeof FilesRoute
   '/databases/$databaseId': typeof DatabasesDatabaseIdRoute
@@ -109,6 +116,7 @@ export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/accounts': typeof AccountsRoute
   '/boards': typeof BoardsRoute
+  '/deep-analysis': typeof DeepAnalysisRoute
   '/engines': typeof EnginesRoute
   '/files': typeof FilesRoute
   '/databases/$databaseId': typeof DatabasesDatabaseIdRoute
@@ -125,6 +133,7 @@ export interface FileRoutesById {
   '/train': typeof TrainRouteRouteWithChildren
   '/accounts': typeof AccountsRoute
   '/boards': typeof BoardsRoute
+  '/deep-analysis': typeof DeepAnalysisRoute
   '/engines': typeof EnginesRoute
   '/files': typeof FilesRoute
   '/databases/$databaseId': typeof DatabasesDatabaseIdRoute
@@ -142,6 +151,7 @@ export interface FileRouteTypes {
     | '/train'
     | '/accounts'
     | '/boards'
+    | '/deep-analysis'
     | '/engines'
     | '/files'
     | '/databases/$databaseId'
@@ -155,6 +165,7 @@ export interface FileRouteTypes {
     | '/'
     | '/accounts'
     | '/boards'
+    | '/deep-analysis'
     | '/engines'
     | '/files'
     | '/databases/$databaseId'
@@ -170,6 +181,7 @@ export interface FileRouteTypes {
     | '/train'
     | '/accounts'
     | '/boards'
+    | '/deep-analysis'
     | '/engines'
     | '/files'
     | '/databases/$databaseId'
@@ -186,6 +198,7 @@ export interface RootRouteChildren {
   TrainRouteRoute: typeof TrainRouteRouteWithChildren
   AccountsRoute: typeof AccountsRoute
   BoardsRoute: typeof BoardsRoute
+  DeepAnalysisRoute: typeof DeepAnalysisRoute
   EnginesRoute: typeof EnginesRoute
   FilesRoute: typeof FilesRoute
   DatabasesDatabaseIdRoute: typeof DatabasesDatabaseIdRoute
@@ -213,6 +226,13 @@ declare module '@tanstack/react-router' {
       path: '/boards'
       fullPath: '/boards'
       preLoaderRoute: typeof BoardsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/deep-analysis': {
+      id: '/deep-analysis'
+      path: '/deep-analysis'
+      fullPath: '/deep-analysis'
+      preLoaderRoute: typeof DeepAnalysisRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/engines': {
@@ -322,6 +342,7 @@ const rootRouteChildren: RootRouteChildren = {
   TrainRouteRoute: TrainRouteRouteWithChildren,
   AccountsRoute: AccountsRoute,
   BoardsRoute: BoardsRoute,
+  DeepAnalysisRoute: DeepAnalysisRoute,
   EnginesRoute: EnginesRoute,
   FilesRoute: FilesRoute,
   DatabasesDatabaseIdRoute: DatabasesDatabaseIdRoute,

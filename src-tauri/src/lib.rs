@@ -6,6 +6,7 @@
 mod app;
 mod chess;
 mod db;
+mod deep_analysis;
 mod error;
 mod fide;
 mod fs;
@@ -23,6 +24,13 @@ use std::sync::{Arc, Mutex};
 use chess::{BestMovesPayload, EngineProcess, ReportProgress};
 use dashmap::DashMap;
 use db::{DatabaseProgress, GameQueryJs, NormalizedGame, PositionStats};
+use deep_analysis::{
+    cancel_deep_analysis, create_deep_analysis_project, list_deep_analysis_projects,
+    list_deep_analysis_results, list_deep_analysis_tasks, pause_deep_analysis,
+    queue_deep_analysis_continuation, queue_deep_analysis_root, resume_deep_analysis,
+    start_deep_analysis,
+};
+use deep_analysis::{DeepAnalysisProgress, DeepAnalysisState};
 use derivative::Derivative;
 use fide::FidePlayer;
 use oauth::AuthState;
@@ -171,13 +179,24 @@ pub async fn run() {
             check_package_installed,
             find_executable_path,
             open_external_link,
-            get_sound_server_port
+            get_sound_server_port,
+            create_deep_analysis_project,
+            list_deep_analysis_projects,
+            list_deep_analysis_tasks,
+            list_deep_analysis_results,
+            queue_deep_analysis_root,
+            queue_deep_analysis_continuation,
+            start_deep_analysis,
+            pause_deep_analysis,
+            resume_deep_analysis,
+            cancel_deep_analysis
         ))
         .events(tauri_specta::collect_events!(
             BestMovesPayload,
             DatabaseProgress,
             DownloadProgress,
-            ReportProgress
+            ReportProgress,
+            DeepAnalysisProgress
         ));
 
     #[cfg(all(debug_assertions, not(target_os = "android")))]

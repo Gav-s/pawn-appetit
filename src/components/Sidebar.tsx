@@ -41,6 +41,7 @@ import * as classes from "./Sidebar.css";
 const labelFallbacks: Record<AppNavigationItem["id"], string> = {
   dashboard: "Dashboard",
   analysis: "Analysis",
+  deepAnalysis: "Deep Analysis",
   games: "Games",
   accounts: "Accounts",
   databases: "Databases",
@@ -63,9 +64,7 @@ function SidebarItem({ item, collapsed }: SidebarItemProps) {
   const { layout } = useResponsiveLayout();
   const Icon = item.icon;
   const label = t(item.labelKey, labelFallbacks[item.id]);
-  const active = Boolean(
-    matchesRoute({ to: item.url, fuzzy: item.activeMatch !== "exact" }),
-  );
+  const active = Boolean(matchesRoute({ to: item.url, fuzzy: item.activeMatch !== "exact" }));
 
   const content = (
     <Link

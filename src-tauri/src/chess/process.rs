@@ -402,3 +402,53 @@ pub fn parse_uci_attrs(
 
     Ok(best_moves)
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn is_alive(pid: &str) -> bool {
+        std::process::Command::new("sh")
+            .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
+            .status()
+            .expect("check engine process")
+            .success()
+    }
+
+    #[tokio::test]
+    async fn failed_uci_handshake_terminates_engine_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("unresponsive-engine.sh");
+        let pid_file = dir.path().join("engine.pid");
+        std::fs::write(
+            &engine,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let result = EngineProcess::new(engine).await;
+        assert!(matches!(result, Err(Error::EngineTimeout(_))));
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        let pid = pid.trim();
+        let mut alive = is_alive(pid);
+        for _ in 0..20 {
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            alive = is_alive(pid);
+        }
+        if alive {
+            // Don't leave the test's deliberately unresponsive engine running on RED.
+            let _ = std::process::Command::new("sh")
+                .args(["-c", &format!("kill -9 {pid}")])
+                .status();
+        }
+        assert!(!alive, "engine {pid} survived failed UCI initialization");
+    }
+}

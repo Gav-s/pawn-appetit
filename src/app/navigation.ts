@@ -1,5 +1,6 @@
 import {
     IconChartLine,
+    IconChartDots3,
     IconChess,
     type Icon,
     IconCpu,
@@ -14,6 +15,7 @@ export type AppNavigationItem = {
     id:
         | "dashboard"
         | "analysis"
+        | "deepAnalysis"
         | "games"
         | "accounts"
         | "databases"
@@ -44,6 +46,13 @@ export const appNavigationItems: AppNavigationItem[] = [
         labelKey: "features.sidebar.analysis",
         icon: IconChartLine,
         url: "/boards",
+        section: "workbench",
+    },
+    {
+        id: "deepAnalysis",
+        labelKey: "features.sidebar.deepAnalysis",
+        icon: IconChartDots3,
+        url: "/deep-analysis",
         section: "workbench",
     },
     {

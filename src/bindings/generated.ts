@@ -597,6 +597,86 @@ async openExternalLink(url: string) : Promise<Result<null, string>> {
 },
 async getSoundServerPort() : Promise<number> {
     return await TAURI_INVOKE("get_sound_server_port");
+},
+async createDeepAnalysisProject(title: string, engine: string, timeMs: number, multipv: number, fen: string, moves: string[]) : Promise<Result<DeepAnalysisProject, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_deep_analysis_project", { title, engine, timeMs, multipv, fen, moves }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listDeepAnalysisProjects() : Promise<Result<DeepAnalysisProject[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_deep_analysis_projects") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listDeepAnalysisTasks(projectId: string) : Promise<Result<DeepAnalysisTask[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_deep_analysis_tasks", { projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listDeepAnalysisResults(projectId: string) : Promise<Result<DeepAnalysisResult[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_deep_analysis_results", { projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async queueDeepAnalysisRoot(projectId: string, fen: string, ply: number) : Promise<Result<DeepAnalysisTask, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("queue_deep_analysis_root", { projectId, fen, ply }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async queueDeepAnalysisContinuation(projectId: string, parentTaskId: string, fen: string, ply: number) : Promise<Result<DeepAnalysisTask, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("queue_deep_analysis_continuation", { projectId, parentTaskId, fen, ply }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async startDeepAnalysis(projectId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_deep_analysis", { projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async pauseDeepAnalysis(projectId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pause_deep_analysis", { projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async resumeDeepAnalysis(projectId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("resume_deep_analysis", { projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async cancelDeepAnalysis(projectId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("cancel_deep_analysis", { projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -606,11 +686,13 @@ async getSoundServerPort() : Promise<number> {
 export const events = __makeEvents__<{
 bestMovesPayload: BestMovesPayload,
 databaseProgress: DatabaseProgress,
+deepAnalysisProgress: DeepAnalysisProgress,
 downloadProgress: DownloadProgress,
 reportProgress: ReportProgress
 }>({
 bestMovesPayload: "best-moves-payload",
 databaseProgress: "database-progress",
+deepAnalysisProgress: "deep-analysis-progress",
 downloadProgress: "download-progress",
 reportProgress: "report-progress"
 })
@@ -635,6 +717,11 @@ export type BestMoves = { nodes: number; depth: number; score: Score; uciMoves: 
 export type BestMovesPayload = { bestLines: BestMoves[]; engine: string; tab: string; fen: string; moves: string[]; progress: number }
 export type DatabaseInfo = { title: string; description: string; player_count: number; event_count: number; game_count: number; storage_size: bigint; filename: string; indexed: boolean }
 export type DatabaseProgress = { id: string; progress: number }
+export type DeepAnalysisLine = { multipv: number; depth: number; scoreKind: string; scoreValue: number; scorePerspective: string; uciMoves: string[] }
+export type DeepAnalysisProgress = { projectId: string; taskId: string | null; status: string; completed: number; total: number; error: string | null }
+export type DeepAnalysisProject = { id: string; title: string; engine: string; timeMs: number; multipv: number; status: string; createdAt: string }
+export type DeepAnalysisResult = { taskId: string; lines: DeepAnalysisLine[] }
+export type DeepAnalysisTask = { id: string; projectId: string; parentTaskId: string | null; fen: string; moves: string[]; ply: number; status: string; error: string | null }
 export type DownloadProgress = { progress: number; id: string; finished: boolean }
 /**
  * UCI engine configuration (name and available options).

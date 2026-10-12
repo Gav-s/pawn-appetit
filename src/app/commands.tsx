@@ -95,6 +95,7 @@ const navLabelFallbacks: Record<AppNavigationItem["id"], string> = {
   accounts: "Accounts",
   dashboard: "Dashboard",
   analysis: "Analysis",
+  deepAnalysis: "Deep Analysis",
   games: "Games",
   databases: "Databases",
   openings: "Openings",

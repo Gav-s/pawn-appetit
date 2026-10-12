@@ -1,4 +1,4 @@
-use tauri::App;
+use tauri::{App, Manager};
 
 use crate::app::platform;
 use crate::telemetry::handle_initial_run_telemetry;
@@ -11,6 +11,12 @@ pub fn setup_tauri_app(
     log::info!("Setting up tauri application");
 
     platform::init_platform(app)?;
+    app.manage(crate::DeepAnalysisState::default());
+    // A damaged Deep Analysis database must not prevent the rest of the app from opening.
+    // Deep Analysis commands will report the database error when invoked.
+    if let Err(error) = crate::deep_analysis::recover_on_startup(app.handle()) {
+        log::error!("Deep Analysis recovery failed: {error}");
+    }
 
     specta_builder.mount_events(app);
 

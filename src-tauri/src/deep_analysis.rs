@@ -1,0 +1,1638 @@
+//! Persistent, independent UCI analysis queue. This does not share interactive engine processes.
+use crate::chess::{EngineOption, EngineOptions, EngineProcess, GoMode};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use shakmaty::{fen::Fen, uci::UciMove, CastlingMode, Chess, Color, EnPassantMode, Position};
+use specta::Type;
+use std::sync::Mutex;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+use tauri::{path::BaseDirectory, Manager};
+use tauri_specta::Event;
+use vampirc_uci::{parse_one, uci::ScoreValue, UciInfoAttribute, UciMessage};
+
+// A separate file avoids changing the game database schema or competing with its connection pool.
+fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .resolve("deep-analysis.sqlite", BaseDirectory::AppData)
+        .map_err(|e| e.to_string())
+}
+fn start_fen() -> String {
+    Fen::from_position(Chess::default(), EnPassantMode::Legal).to_string()
+}
+fn position(fen: &str) -> Result<Chess, String> {
+    let fen = if fen == "startpos" {
+        start_fen()
+    } else {
+        fen.to_owned()
+    };
+    fen.parse::<Fen>()
+        .map_err(|e| e.to_string())?
+        .into_position(CastlingMode::Chess960)
+        .map_err(|e| e.to_string())
+}
+
+fn position_after(fen: &str, moves: &[String]) -> Result<Chess, String> {
+    let mut board = position(fen)?;
+    for text in moves {
+        let uci = UciMove::from_ascii(text.as_bytes()).map_err(|e| e.to_string())?;
+        let mv = uci.to_move(&board).map_err(|e| e.to_string())?;
+        board.play_unchecked(&mv);
+    }
+    Ok(board)
+}
+
+fn validate_engine_path(path: &str) -> Result<(), String> {
+    let p = Path::new(path);
+    if !p.is_absolute() || !p.is_file() {
+        return Err("engine must be an installed local executable".into());
+    }
+    #[cfg(unix)]
+    if std::os::unix::fs::PermissionsExt::mode(
+        &p.metadata().map_err(|e| e.to_string())?.permissions(),
+    ) & 0o111
+        == 0
+    {
+        return Err("engine is not executable".into());
+    }
+    Ok(())
+}
+
+fn registered_engine(path: &str, registration: &Path) -> Result<(), String> {
+    validate_engine_path(path)?;
+    let data = std::fs::read_to_string(registration).map_err(|e| e.to_string())?;
+    let engines: Vec<serde_json::Value> = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+    let requested = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+    if engines.iter().any(|e| {
+        e.get("type").and_then(|v| v.as_str()) == Some("local")
+            && e.get("path")
+                .and_then(|v| v.as_str())
+                .and_then(|s| std::fs::canonicalize(s).ok())
+                .as_ref()
+                == Some(&requested)
+    }) {
+        Ok(())
+    } else {
+        Err("engine is not registered as an installed local engine".into())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepAnalysisProject {
+    pub id: String,
+    pub title: String,
+    pub engine: String,
+    pub time_ms: u32,
+    pub multipv: u16,
+    pub status: String,
+    pub created_at: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepAnalysisTask {
+    pub id: String,
+    pub project_id: String,
+    pub parent_task_id: Option<String>,
+    pub fen: String,
+    pub moves: Vec<String>,
+    pub ply: u32,
+    pub status: String,
+    pub error: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepAnalysisLine {
+    pub multipv: u16,
+    pub depth: u32,
+    pub score_kind: String,
+    pub score_value: i32,
+    pub score_perspective: String,
+    pub uci_moves: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepAnalysisResult {
+    pub task_id: String,
+    pub lines: Vec<DeepAnalysisLine>,
+}
+#[derive(Debug, Clone, Serialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepAnalysisProgress {
+    pub project_id: String,
+    pub task_id: Option<String>,
+    pub status: String,
+    pub completed: u32,
+    pub total: u32,
+    pub error: Option<String>,
+}
+
+struct Store {
+    path: PathBuf,
+}
+impl Store {
+    fn open(path: &Path) -> Result<Self, String> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let store = Self {
+            path: path.to_owned(),
+        };
+        let conn = store.conn()?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS deep_projects (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL, engine TEXT NOT NULL, depth INTEGER NOT NULL DEFAULT 0, time_ms INTEGER NOT NULL DEFAULT 1000,
+            multipv INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'paused',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')));
+            CREATE TABLE IF NOT EXISTS deep_tasks (
+            id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES deep_projects(id) ON DELETE CASCADE,
+            parent_task_id TEXT REFERENCES deep_tasks(id), fen TEXT NOT NULL, moves TEXT NOT NULL DEFAULT '[]', ply INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued', error TEXT);
+            CREATE INDEX IF NOT EXISTS deep_tasks_project ON deep_tasks(project_id, status);
+            CREATE TABLE IF NOT EXISTS deep_results (
+            task_id TEXT NOT NULL REFERENCES deep_tasks(id) ON DELETE CASCADE,
+            multipv INTEGER NOT NULL, depth INTEGER NOT NULL, score_kind TEXT NOT NULL,
+            score_value INTEGER NOT NULL, score_perspective TEXT NOT NULL DEFAULT 'white', uci_moves TEXT NOT NULL,
+            PRIMARY KEY(task_id, multipv));").map_err(|e| e.to_string())?;
+        // Migration for projects created by earlier development builds.
+        let project_columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(deep_projects)")
+            .map_err(|e| e.to_string())?
+            .query_map([], |r| r.get(1))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        if !project_columns.iter().any(|c| c == "time_ms") {
+            conn.execute_batch(
+                "ALTER TABLE deep_projects ADD COLUMN time_ms INTEGER NOT NULL DEFAULT 1000",
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let task_columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(deep_tasks)")
+            .map_err(|e| e.to_string())?
+            .query_map([], |r| r.get(1))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        if !task_columns.iter().any(|c| c == "moves") {
+            conn.execute_batch(
+                "ALTER TABLE deep_tasks ADD COLUMN moves TEXT NOT NULL DEFAULT '[]'",
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let result_columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(deep_results)")
+            .map_err(|e| e.to_string())?
+            .query_map([], |r| r.get(1))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        if !result_columns.iter().any(|c| c == "score_perspective") {
+            conn.execute_batch("ALTER TABLE deep_results ADD COLUMN score_perspective TEXT NOT NULL DEFAULT 'white'")
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(store)
+    }
+    fn conn(&self) -> Result<Connection, String> {
+        let c = Connection::open(&self.path).map_err(|e| e.to_string())?;
+        c.busy_timeout(Duration::from_secs(5))
+            .map_err(|e| e.to_string())?;
+        c.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|e| e.to_string())?;
+        Ok(c)
+    }
+    fn recover(&self) -> Result<(), String> {
+        let c = self.conn()?;
+        c.execute_batch(
+            "BEGIN IMMEDIATE;
+          UPDATE deep_tasks SET status='queued' WHERE status='running';
+          UPDATE deep_projects SET status='paused' WHERE status='running'; COMMIT;",
+        )
+        .map_err(|e| e.to_string())
+    }
+    fn create_project(
+        &self,
+        title: &str,
+        engine: &str,
+        time_ms: u32,
+        multipv: u16,
+        fen: &str,
+        moves: &[String],
+    ) -> Result<DeepAnalysisProject, String> {
+        if title.trim().is_empty()
+            || time_ms == 0
+            || time_ms > 3_600_000
+            || multipv == 0
+            || multipv > 32
+        {
+            return Err("title, timeMs 1..3600000 and MultiPV 1..32 are required".into());
+        }
+        validate_engine_path(engine)?;
+        let normalized = if fen == "startpos" {
+            start_fen()
+        } else {
+            fen.to_owned()
+        };
+        position_after(&normalized, moves)?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute("INSERT INTO deep_projects(id,title,engine,depth,time_ms,multipv) VALUES(?1,?2,?3,0,?4,?5)",
+            params![id, title, engine, time_ms, multipv]).map_err(|e| e.to_string())?;
+        tx.execute("INSERT INTO deep_tasks(id,project_id,parent_task_id,fen,moves,ply) VALUES(?1,?2,NULL,?3,?4,?5)",
+            params![task_id, id, normalized, serde_json::to_string(moves).map_err(|e| e.to_string())?, moves.len() as u32]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        self.get_project(&id)?
+            .ok_or_else(|| "project not found".into())
+    }
+    fn get_project(&self, id: &str) -> Result<Option<DeepAnalysisProject>, String> {
+        self.conn()?.query_row("SELECT id,title,engine,time_ms,multipv,status,created_at FROM deep_projects WHERE id=?1", [id], |r| Ok(DeepAnalysisProject {id:r.get(0)?,title:r.get(1)?,engine:r.get(2)?,time_ms:r.get(3)?,multipv:r.get(4)?,status:r.get(5)?,created_at:r.get(6)?})).optional().map_err(|e| e.to_string())
+    }
+    fn list_projects(&self) -> Result<Vec<DeepAnalysisProject>, String> {
+        let c = self.conn()?;
+        let mut q=c.prepare("SELECT id,title,engine,time_ms,multipv,status,created_at FROM deep_projects ORDER BY created_at DESC, rowid DESC").map_err(|e| e.to_string())?;
+        let rows = q
+            .query_map([], |r| {
+                Ok(DeepAnalysisProject {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    engine: r.get(2)?,
+                    time_ms: r.get(3)?,
+                    multipv: r.get(4)?,
+                    status: r.get(5)?,
+                    created_at: r.get(6)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+    fn queue(
+        &self,
+        project_id: &str,
+        parent_task_id: Option<&str>,
+        fen: &str,
+        ply: u32,
+    ) -> Result<DeepAnalysisTask, String> {
+        let normalized = if fen == "startpos" {
+            start_fen()
+        } else {
+            fen.to_owned()
+        };
+        position(&normalized)?;
+        if self.get_project(project_id)?.is_none() {
+            return Err("project not found".into());
+        }
+        if let Some(parent) = parent_task_id {
+            let parent = self
+                .list_tasks(project_id)?
+                .into_iter()
+                .find(|t| t.id == parent)
+                .ok_or("parent task not in project")?;
+            if parent.status != "completed" {
+                return Err("parent task is not completed".into());
+            }
+            let lines = self
+                .results(project_id)?
+                .into_iter()
+                .find(|r| r.task_id == parent.id)
+                .ok_or("parent task has no PV".to_owned())?;
+            let mut descendant = false;
+            for line in lines.lines {
+                let mut board = position_after(&parent.fen, &parent.moves)?;
+                for (index, text) in line.uci_moves.iter().enumerate() {
+                    let uci = UciMove::from_ascii(text.as_bytes()).map_err(|e| e.to_string())?;
+                    let mv = uci.to_move(&board).map_err(|e| e.to_string())?;
+                    board.play_unchecked(&mv);
+                    if ply == parent.ply + index as u32 + 1
+                        && Fen::from_position(board.clone(), EnPassantMode::Legal).to_string()
+                            == normalized
+                    {
+                        descendant = true;
+                        break;
+                    }
+                }
+                if descendant {
+                    break;
+                }
+            }
+            if !descendant {
+                return Err("continuation must follow a completed parent PV".into());
+            }
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        if self
+            .conn()?
+            .execute(
+                "INSERT INTO deep_tasks(id,project_id,parent_task_id,fen,moves,ply)
+            SELECT ?1,?2,?3,?4,?5,?6 WHERE EXISTS (
+                SELECT 1 FROM deep_projects WHERE id=?2 AND status!='cancelled'
+            )",
+                params![id, project_id, parent_task_id, normalized, "[]", ply],
+            )
+            .map_err(|e| e.to_string())?
+            == 0
+        {
+            return Err("cancelled project cannot accept tasks".into());
+        }
+        Ok(DeepAnalysisTask {
+            id,
+            project_id: project_id.into(),
+            parent_task_id: parent_task_id.map(str::to_owned),
+            fen: normalized,
+            moves: vec![],
+            ply,
+            status: "queued".into(),
+            error: None,
+        })
+    }
+    fn queue_root(
+        &self,
+        project_id: &str,
+        fen: &str,
+        ply: u32,
+    ) -> Result<DeepAnalysisTask, String> {
+        self.queue(project_id, None, fen, ply)
+    }
+    fn list_tasks(&self, project_id: &str) -> Result<Vec<DeepAnalysisTask>, String> {
+        let c = self.conn()?;
+        let mut q=c.prepare("SELECT id,project_id,parent_task_id,fen,moves,ply,status,error FROM deep_tasks WHERE project_id=?1 ORDER BY rowid").map_err(|e| e.to_string())?;
+        let rows = q
+            .query_map([project_id], |r| {
+                Ok(DeepAnalysisTask {
+                    id: r.get(0)?,
+                    project_id: r.get(1)?,
+                    parent_task_id: r.get(2)?,
+                    fen: r.get(3)?,
+                    moves: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
+                    ply: r.get(5)?,
+                    status: r.get(6)?,
+                    error: r.get(7)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+    fn results(&self, project_id: &str) -> Result<Vec<DeepAnalysisResult>, String> {
+        let c = self.conn()?;
+        let mut q=c.prepare("SELECT r.task_id,r.multipv,r.depth,r.score_kind,r.score_value,r.score_perspective,r.uci_moves FROM deep_results r JOIN deep_tasks t ON t.id=r.task_id WHERE t.project_id=?1 ORDER BY t.rowid,r.multipv").map_err(|e| e.to_string())?;
+        let rows = q
+            .query_map([project_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    DeepAnalysisLine {
+                        multipv: r.get(1)?,
+                        depth: r.get(2)?,
+                        score_kind: r.get(3)?,
+                        score_value: r.get(4)?,
+                        score_perspective: r.get(5)?,
+                        uci_moves: serde_json::from_str(&r.get::<_, String>(6)?)
+                            .unwrap_or_default(),
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out: Vec<DeepAnalysisResult> = vec![];
+        for row in rows {
+            let (task_id, line) = row.map_err(|e| e.to_string())?;
+            if out.last().is_none_or(|v| v.task_id != task_id) {
+                out.push(DeepAnalysisResult {
+                    task_id,
+                    lines: vec![],
+                });
+            }
+            out.last_mut().unwrap().lines.push(line);
+        }
+        Ok(out)
+    }
+    fn cancel(&self, id: &str) -> Result<(), String> {
+        let mut c = self.conn()?;
+        let tx = c.transaction().map_err(|e| e.to_string())?;
+        let n = tx
+            .execute(
+                "UPDATE deep_projects SET status='cancelled' WHERE id=?1",
+                [id],
+            )
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("project not found".into());
+        }
+        tx.execute("UPDATE deep_tasks SET status='cancelled' WHERE project_id=?1 AND status IN ('queued','running')",[id]).map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+    fn status(&self, id: &str) -> Result<String, String> {
+        self.get_project(id)?
+            .map(|p| p.status)
+            .ok_or_else(|| "project not found".into())
+    }
+    fn fail_worker(&self, id: &str, error: &str) -> Result<(), String> {
+        let mut c = self.conn()?;
+        let tx = c.transaction().map_err(|e| e.to_string())?;
+        let updated = tx
+            .execute(
+                "UPDATE deep_projects SET status='failed' WHERE id=?1 AND status='running'",
+                [id],
+            )
+            .map_err(|e| e.to_string())?;
+        if updated != 0 {
+            tx.execute("UPDATE deep_tasks SET status='failed',error=?2 WHERE project_id=?1 AND status='running'", params![id,error]).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+    fn pause(&self, id: &str) -> Result<(), String> {
+        let mut c = self.conn()?;
+        let tx = c.transaction().map_err(|e| e.to_string())?;
+        if tx
+            .execute(
+                "UPDATE deep_projects SET status='paused' WHERE id=?1 AND status!='cancelled'",
+                [id],
+            )
+            .map_err(|e| e.to_string())?
+            == 0
+        {
+            return Err("project not found or cancelled".into());
+        }
+        tx.execute(
+            "UPDATE deep_tasks SET status='queued' WHERE project_id=?1 AND status='running'",
+            [id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+    fn finish(&self, id: &str) -> Result<bool, String> {
+        let updated = self
+            .conn()?
+            .execute(
+                "UPDATE deep_projects SET status=CASE WHEN EXISTS (
+                    SELECT 1 FROM deep_tasks WHERE project_id=?1 AND status='failed'
+                ) THEN 'failed' ELSE 'completed' END
+                WHERE id=?1 AND status='running' AND NOT EXISTS (
+                    SELECT 1 FROM deep_tasks WHERE project_id=?1 AND status IN ('queued','running')
+                )",
+                [id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(updated != 0)
+    }
+    fn begin_running(&self, id: &str, expected: &str) -> Result<(), String> {
+        let count = self.conn()?.execute(
+            "UPDATE deep_projects SET status='running' WHERE id=?1 AND status=?2 AND status!='cancelled'",
+            params![id, expected],
+        ).map_err(|e| e.to_string())?;
+        if count == 0 {
+            Err("project changed state before start".into())
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(test)]
+    fn set_status(&self, id: &str, status: &str) -> Result<(), String> {
+        let n = self
+            .conn()?
+            .execute(
+                "UPDATE deep_projects SET status=?2 WHERE id=?1",
+                params![id, status],
+            )
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            Err("project not found".into())
+        } else {
+            Ok(())
+        }
+    }
+    fn claim(&self, project_id: &str) -> Result<Option<DeepAnalysisTask>, String> {
+        let mut c = self.conn()?;
+        let tx = c.transaction().map_err(|e| e.to_string())?;
+        let id:Option<String>=tx.query_row("SELECT t.id FROM deep_tasks t JOIN deep_projects p ON p.id=t.project_id WHERE t.project_id=?1 AND t.status='queued' AND p.status='running' ORDER BY t.rowid LIMIT 1",[project_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        if let Some(ref id) = id {
+            tx.execute(
+                "UPDATE deep_tasks SET status='running',error=NULL WHERE id=?1",
+                [id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(self
+            .list_tasks(project_id)?
+            .into_iter()
+            .find(|t| Some(&t.id) == id.as_ref()))
+    }
+    fn requeue(&self, id: &str) -> Result<(), String> {
+        self.conn()?
+            .execute(
+                "UPDATE deep_tasks SET status='queued' WHERE id=?1 AND status='running'",
+                [id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    fn fail(&self, id: &str, error: &str) -> Result<(), String> {
+        self.conn()?
+            .execute(
+                "UPDATE deep_tasks SET status='failed',error=?2 WHERE id=?1 AND status='running'",
+                params![id, error],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    fn snapshot(&self, task_id: &str, line: &DeepAnalysisLine) -> Result<(), String> {
+        let c = self.conn()?;
+        // A pause/cancel can race an engine line: the write and status check must be atomic.
+        c.execute("INSERT INTO deep_results(task_id,multipv,depth,score_kind,score_value,score_perspective,uci_moves)
+            SELECT t.id,?2,?3,?4,?5,?6,?7 FROM deep_tasks t JOIN deep_projects p ON p.id=t.project_id
+            WHERE t.id=?1 AND t.status='running' AND p.status='running'
+            ON CONFLICT(task_id,multipv) DO UPDATE SET depth=excluded.depth,score_kind=excluded.score_kind,
+                score_value=excluded.score_value,score_perspective=excluded.score_perspective,uci_moves=excluded.uci_moves
+            WHERE excluded.depth >= deep_results.depth",
+            params![task_id,line.multipv,line.depth,line.score_kind,line.score_value,line.score_perspective,
+                serde_json::to_string(&line.uci_moves).map_err(|e|e.to_string())?])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    fn save(&self, task_id: &str, lines: &[DeepAnalysisLine]) -> Result<(), String> {
+        if lines.is_empty() {
+            return Err("no valid scored PV".into());
+        }
+        let mut c = self.conn()?;
+        let tx = c.transaction().map_err(|e| e.to_string())?;
+        let running:i64=tx.query_row("SELECT count(*) FROM deep_tasks t JOIN deep_projects p ON p.id=t.project_id WHERE t.id=?1 AND t.status='running' AND p.status='running'",[task_id],|r|r.get(0)).map_err(|e|e.to_string())?;
+        if running == 0 {
+            return Err("task is no longer running".into());
+        }
+        tx.execute("DELETE FROM deep_results WHERE task_id=?1", [task_id])
+            .map_err(|e| e.to_string())?;
+        for line in lines {
+            tx.execute("INSERT INTO deep_results(task_id,multipv,depth,score_kind,score_value,score_perspective,uci_moves) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![task_id,line.multipv,line.depth,line.score_kind,line.score_value,line.score_perspective,serde_json::to_string(&line.uci_moves).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
+        }
+        tx.execute(
+            "UPDATE deep_tasks SET status='completed' WHERE id=?1",
+            [task_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+    fn progress(
+        &self,
+        project_id: &str,
+        task_id: Option<String>,
+        error: Option<String>,
+    ) -> Result<DeepAnalysisProgress, String> {
+        let tasks = self.list_tasks(project_id)?;
+        Ok(DeepAnalysisProgress {
+            project_id: project_id.into(),
+            task_id,
+            status: self.status(project_id)?,
+            completed: tasks.iter().filter(|t| t.status == "completed").count() as u32,
+            total: tasks.len() as u32,
+            error,
+        })
+    }
+}
+
+// Validate the entire PV against the board; never persist a truncated/illegal continuation.
+fn parse_line(text: &str, fen: &str, history: &[String]) -> Option<DeepAnalysisLine> {
+    let mut board = position_after(fen, history).ok()?;
+    let turn = board.turn();
+    let mut multipv = 1;
+    let mut depth = 0;
+    let mut score = None;
+    let mut moves = None;
+    if let UciMessage::Info(attrs) = parse_one(text) {
+        for attr in attrs {
+            match attr {
+                UciInfoAttribute::MultiPv(v) => multipv = v,
+                UciInfoAttribute::Depth(v) => depth = v,
+                UciInfoAttribute::Score(v) => score = Some(v.value),
+                UciInfoAttribute::Pv(v) => moves = Some(v),
+                _ => {}
+            }
+        }
+    }
+    let (score_kind, score_value) = match score? {
+        ScoreValue::Cp(v) => ("cp", v),
+        ScoreValue::Mate(v) => ("mate", v),
+    };
+    let mut uci_moves = vec![];
+    for m in moves? {
+        let uci = UciMove::from_ascii(m.to_string().as_bytes()).ok()?;
+        let mv = uci.to_move(&board).ok()?;
+        board.play_unchecked(&mv);
+        uci_moves.push(uci.to_string());
+    }
+    if depth == 0 || multipv == 0 || uci_moves.is_empty() {
+        return None;
+    }
+    Some(DeepAnalysisLine {
+        multipv,
+        depth,
+        score_kind: score_kind.into(),
+        score_value: if turn == Color::Black {
+            -score_value
+        } else {
+            score_value
+        },
+        score_perspective: "white".into(),
+        uci_moves,
+    })
+}
+
+#[derive(Default)]
+pub struct DeepAnalysisState {
+    active: Arc<Mutex<Option<String>>>,
+}
+struct WorkerLease {
+    active: Arc<Mutex<Option<String>>>,
+}
+impl Drop for WorkerLease {
+    fn drop(&mut self) {
+        *self.active.lock().unwrap() = None;
+    }
+}
+impl DeepAnalysisState {
+    async fn acquire_after_drain(&self, project_id: &str) -> Result<WorkerLease, String> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                {
+                    let active = self.active.lock().map_err(|e| e.to_string())?;
+                    if active.as_deref().is_some_and(|id| id != project_id) {
+                        return Err("another deep analysis project is active".into());
+                    }
+                }
+                if let Ok(lease) = self.acquire(project_id) {
+                    return Ok(lease);
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .map_err(|_| "previous worker did not stop in time".to_owned())?
+    }
+    fn acquire(&self, project_id: &str) -> Result<WorkerLease, String> {
+        let mut active = self.active.lock().map_err(|e| e.to_string())?;
+        if active.is_some() {
+            return Err("deep analysis worker already active".into());
+        }
+        *active = Some(project_id.to_owned());
+        Ok(WorkerLease {
+            active: self.active.clone(),
+        })
+    }
+}
+fn store(app: &tauri::AppHandle) -> Result<Store, String> {
+    Store::open(&database_path(app)?)
+}
+pub fn recover_on_startup(app: &tauri::AppHandle) -> Result<(), String> {
+    store(app)?.recover()
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn create_deep_analysis_project(
+    app: tauri::AppHandle,
+    title: String,
+    engine: String,
+    time_ms: u32,
+    multipv: u16,
+    fen: String,
+    moves: Vec<String>,
+) -> Result<DeepAnalysisProject, String> {
+    let registration = app
+        .path()
+        .resolve("engines/engines.json", BaseDirectory::AppData)
+        .map_err(|e| e.to_string())?;
+    registered_engine(&engine, &registration)?;
+    store(&app)?.create_project(&title, &engine, time_ms, multipv, &fen, &moves)
+}
+#[tauri::command]
+#[specta::specta]
+pub fn list_deep_analysis_projects(
+    app: tauri::AppHandle,
+) -> Result<Vec<DeepAnalysisProject>, String> {
+    store(&app)?.list_projects()
+}
+#[tauri::command]
+#[specta::specta]
+pub fn list_deep_analysis_tasks(
+    app: tauri::AppHandle,
+    project_id: String,
+) -> Result<Vec<DeepAnalysisTask>, String> {
+    store(&app)?.list_tasks(&project_id)
+}
+#[tauri::command]
+#[specta::specta]
+pub fn list_deep_analysis_results(
+    app: tauri::AppHandle,
+    project_id: String,
+) -> Result<Vec<DeepAnalysisResult>, String> {
+    store(&app)?.results(&project_id)
+}
+#[tauri::command]
+#[specta::specta]
+pub fn queue_deep_analysis_root(
+    app: tauri::AppHandle,
+    project_id: String,
+    fen: String,
+    ply: u32,
+) -> Result<DeepAnalysisTask, String> {
+    store(&app)?.queue_root(&project_id, &fen, ply)
+}
+#[tauri::command]
+#[specta::specta]
+pub fn queue_deep_analysis_continuation(
+    app: tauri::AppHandle,
+    project_id: String,
+    parent_task_id: String,
+    fen: String,
+    ply: u32,
+) -> Result<DeepAnalysisTask, String> {
+    store(&app)?.queue(&project_id, Some(&parent_task_id), &fen, ply)
+}
+#[tauri::command]
+#[specta::specta]
+pub fn pause_deep_analysis(app: tauri::AppHandle, project_id: String) -> Result<(), String> {
+    let s = store(&app)?;
+    s.pause(&project_id)?;
+    let _ = DeepAnalysisProgress::emit(&s.progress(&project_id, None, None)?, &app);
+    Ok(())
+}
+#[tauri::command]
+#[specta::specta]
+pub fn cancel_deep_analysis(app: tauri::AppHandle, project_id: String) -> Result<(), String> {
+    let s = store(&app)?;
+    s.cancel(&project_id)?;
+    let _ = DeepAnalysisProgress::emit(&s.progress(&project_id, None, None)?, &app);
+    Ok(())
+}
+#[tauri::command]
+#[specta::specta]
+pub async fn resume_deep_analysis(
+    app: tauri::AppHandle,
+    project_id: String,
+    state: tauri::State<'_, DeepAnalysisState>,
+) -> Result<(), String> {
+    launch(app, project_id, &state).await
+}
+#[tauri::command]
+#[specta::specta]
+pub async fn start_deep_analysis(
+    app: tauri::AppHandle,
+    project_id: String,
+    state: tauri::State<'_, DeepAnalysisState>,
+) -> Result<(), String> {
+    launch(app, project_id, &state).await
+}
+async fn launch(
+    app: tauri::AppHandle,
+    project_id: String,
+    state: &DeepAnalysisState,
+) -> Result<(), String> {
+    let s = store(&app)?;
+    let initial_status = s.status(&project_id)?;
+    if initial_status == "cancelled" {
+        return Err("cancelled project cannot resume".into());
+    }
+    if initial_status == "running" {
+        return Err("project already running".into());
+    }
+    let project = s.get_project(&project_id)?.ok_or("project not found")?;
+    let registration = app
+        .path()
+        .resolve("engines/engines.json", BaseDirectory::AppData)
+        .map_err(|e| e.to_string())?;
+    registered_engine(&project.engine, &registration)?;
+    // Hold the single gate through engine termination and worker teardown.
+    let lease = state.acquire_after_drain(&project_id).await?;
+    let current_status = s.status(&project_id)?;
+    if current_status != initial_status {
+        return Err(format!(
+            "project changed state while waiting for worker: {current_status}"
+        ));
+    }
+    s.begin_running(&project_id, &initial_status)?;
+    tauri::async_runtime::spawn(async move {
+        let _lease = lease;
+        if let Err(e) = run_worker(&app, &project_id).await {
+            log::error!("Deep analysis worker {}: {}", project_id, e);
+            if let Ok(s) = store(&app) {
+                let _ = s.fail_worker(&project_id, &e);
+                if let Ok(progress) = s.progress(&project_id, None, Some(e)) {
+                    let _ = progress.emit(&app);
+                }
+            }
+        }
+    });
+    Ok(())
+}
+async fn run_worker(app: &tauri::AppHandle, project_id: &str) -> Result<(), String> {
+    let s = store(app)?;
+    loop {
+        if s.status(project_id)? != "running" {
+            break;
+        }
+        let Some(task) = s.claim(project_id)? else {
+            if !s.finish(project_id)? {
+                continue; // Queue won the race after claim returned None.
+            }
+            let _ = DeepAnalysisProgress::emit(&s.progress(project_id, None, None)?, app);
+            break;
+        };
+        let project = s.get_project(project_id)?.ok_or("project not found")?;
+        let outcome = analyze_position(&project, &task, &s).await;
+        if s.status(project_id)? != "running" {
+            s.requeue(&task.id)?;
+            break;
+        }
+        match outcome {
+            Ok(lines) => {
+                if let Err(e) = s.save(&task.id, &lines) {
+                    if s.status(project_id)? != "running" {
+                        s.requeue(&task.id)?;
+                        break;
+                    }
+                    s.fail(&task.id, &e)?;
+                    let _ = DeepAnalysisProgress::emit(
+                        &s.progress(project_id, Some(task.id.clone()), Some(e))?,
+                        app,
+                    );
+                    continue;
+                }
+            }
+            Err(e) => {
+                s.fail(&task.id, &e)?;
+                let _ = DeepAnalysisProgress::emit(
+                    &s.progress(project_id, Some(task.id.clone()), Some(e))?,
+                    app,
+                );
+                continue;
+            }
+        }
+        let _ = DeepAnalysisProgress::emit(&s.progress(project_id, Some(task.id), None)?, app);
+    }
+    Ok(())
+}
+async fn analyze_position(
+    project: &DeepAnalysisProject,
+    task: &DeepAnalysisTask,
+    s: &Store,
+) -> Result<Vec<DeepAnalysisLine>, String> {
+    // Dropping a pending handshake kills its child (UciCommunicator uses kill_on_drop).
+    let handshake = EngineProcess::new(PathBuf::from(&project.engine));
+    tokio::pin!(handshake);
+    let (mut engine, mut reader) = loop {
+        tokio::select! {
+            result = &mut handshake => break result.map_err(|e| e.to_string())?,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if s.status(&project.id)? != "running" {
+                    return Err("interrupted".into());
+                }
+            }
+        }
+    };
+    if s.status(&project.id)? != "running" {
+        let _ = engine.kill().await;
+        return Err("interrupted".into());
+    }
+    let outcome = async {
+        engine
+            .set_options(EngineOptions {
+                fen: task.fen.clone(),
+                moves: task.moves.clone(),
+                extra_options: vec![EngineOption {
+                    name: "MultiPV".into(),
+                    value: project.multipv.to_string(),
+                }],
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        engine
+            .go(&GoMode::Time(project.time_ms))
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut best = std::collections::BTreeMap::<u16, DeepAnalysisLine>::new();
+        loop {
+            let next = tokio::time::timeout(Duration::from_millis(100), reader.next_line()).await;
+            if s.status(&project.id)? != "running" {
+                let _ = engine.stop().await;
+                return Err("interrupted".into());
+            }
+            match next {
+                Err(_) => continue,
+                Ok(Err(e)) => return Err(e.to_string()),
+                Ok(Ok(None)) => return Err("engine exited before bestmove".into()),
+                Ok(Ok(Some(line))) => {
+                    if matches!(parse_one(&line), UciMessage::BestMove { .. }) {
+                        break;
+                    }
+                    if let Some(parsed) = parse_line(&line, &task.fen, &task.moves) {
+                        if parsed.multipv <= project.multipv
+                            && best
+                                .get(&parsed.multipv)
+                                .is_none_or(|old| old.depth <= parsed.depth)
+                        {
+                            s.snapshot(&task.id, &parsed)?;
+                            best.insert(parsed.multipv, parsed);
+                        }
+                    }
+                }
+            }
+        }
+        if best.is_empty() {
+            return Err("engine produced no valid scored PV".into());
+        }
+        Ok(best.into_values().collect())
+    };
+    let result = tokio::time::timeout(
+        Duration::from_millis(u64::from(project.time_ms) + 10_000),
+        outcome,
+    )
+    .await
+    .map_err(|_| "engine search timed out".to_owned())
+    .and_then(|v| v);
+    let _ = engine.kill().await;
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn creation_is_atomic_and_preserves_position_history_and_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let engine = std::env::current_exe().unwrap();
+        let fen = start_fen();
+        assert!(s
+            .create_project(
+                "invalid",
+                engine.to_str().unwrap(),
+                1000,
+                2,
+                &fen,
+                &["e2e5".into()]
+            )
+            .is_err());
+        assert!(s.list_projects().unwrap().is_empty());
+        let p = s
+            .create_project(
+                "valid",
+                engine.to_str().unwrap(),
+                1000,
+                2,
+                &fen,
+                &["e2e4".into()],
+            )
+            .unwrap();
+        assert_eq!(p.time_ms, 1000);
+        let tasks = s.list_tasks(&p.id).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].fen, fen);
+        assert_eq!(tasks[0].moves, vec!["e2e4"]);
+        assert!(s
+            .create_project("bad", engine.to_str().unwrap(), 0, 1, &fen, &[])
+            .is_err());
+        assert!(s
+            .create_project("bad", engine.to_str().unwrap(), u32::MAX, 1, &fen, &[])
+            .is_err());
+        assert!(s
+            .create_project("bad", "/definitely/not/an/engine", 1000, 1, &fen, &[])
+            .is_err());
+    }
+    #[test]
+    fn pause_requeues_running_task_and_failure_never_overwrites_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let engine = std::env::current_exe().unwrap();
+        let p = s
+            .create_project("x", engine.to_str().unwrap(), 1000, 1, &start_fen(), &[])
+            .unwrap();
+        let task = s.list_tasks(&p.id).unwrap().remove(0);
+        s.set_status(&p.id, "running").unwrap();
+        s.claim(&p.id).unwrap();
+        s.pause(&p.id).unwrap();
+        assert_eq!(s.list_tasks(&p.id).unwrap()[0].status, "queued");
+        s.cancel(&p.id).unwrap();
+        s.fail(&task.id, "late failure").unwrap();
+        assert_eq!(s.status(&p.id).unwrap(), "cancelled");
+        assert_eq!(s.list_tasks(&p.id).unwrap()[0].status, "cancelled");
+    }
+    #[test]
+    fn global_worker_gate_rejects_other_project_until_release() {
+        let state = DeepAnalysisState::default();
+        let first = state.acquire("first").unwrap();
+        assert!(state.acquire("other").is_err());
+        assert!(state.acquire("first").is_err());
+        drop(first);
+        assert!(state.acquire("other").is_ok());
+    }
+    #[test]
+    fn failed_task_cannot_make_project_completed_when_queue_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let engine = std::env::current_exe().unwrap();
+        let p = s
+            .create_project(
+                "failure",
+                engine.to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let task = s.claim(&p.id).unwrap().unwrap();
+        s.fail(&task.id, "engine exited").unwrap();
+        assert!(s.claim(&p.id).unwrap().is_none());
+        s.finish(&p.id).unwrap();
+        assert_eq!(s.status(&p.id).unwrap(), "failed");
+        assert_eq!(s.progress(&p.id, None, None).unwrap().completed, 0);
+    }
+    #[test]
+    fn worker_error_marks_running_task_failed_without_touching_paused_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let engine = std::env::current_exe().unwrap();
+        let p = s
+            .create_project("x", engine.to_str().unwrap(), 1000, 1, &start_fen(), &[])
+            .unwrap();
+        s.set_status(&p.id, "running").unwrap();
+        s.claim(&p.id).unwrap();
+        s.fail_worker(&p.id, "save failed").unwrap();
+        assert_eq!(s.status(&p.id).unwrap(), "failed");
+        assert_eq!(s.list_tasks(&p.id).unwrap()[0].status, "failed");
+        s.set_status(&p.id, "running").unwrap();
+        s.pause(&p.id).unwrap();
+        s.fail_worker(&p.id, "late failure").unwrap();
+        assert_eq!(s.status(&p.id).unwrap(), "paused");
+    }
+    #[test]
+    fn registered_engine_rejects_unregistered_executables() {
+        let dir = tempfile::tempdir().unwrap();
+        let registration = dir.path().join("engines.json");
+        let executable = std::env::current_exe().unwrap();
+        std::fs::write(&registration, "[]").unwrap();
+        assert!(registered_engine(executable.to_str().unwrap(), &registration).is_err());
+        std::fs::write(
+            &registration,
+            serde_json::json!([{"type":"local", "path":executable}]).to_string(),
+        )
+        .unwrap();
+        registered_engine(executable.to_str().unwrap(), &registration).unwrap();
+    }
+    #[test]
+    fn cancelled_projects_reject_new_roots_and_continuations() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let engine = std::env::current_exe().unwrap();
+        let p = s
+            .create_project("x", engine.to_str().unwrap(), 1000, 1, &start_fen(), &[])
+            .unwrap();
+        let parent = s.list_tasks(&p.id).unwrap().remove(0);
+        s.cancel(&p.id).unwrap();
+        assert!(s.queue_root(&p.id, "startpos", 0).is_err());
+        assert!(s.queue(&p.id, Some(&parent.id), "startpos", 1).is_err());
+        assert_eq!(s.list_tasks(&p.id).unwrap().len(), 1);
+    }
+    #[test]
+    fn continuation_requires_completed_parent_and_a_position_on_its_pv() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let engine = std::env::current_exe().unwrap();
+        let p = s
+            .create_project("x", engine.to_str().unwrap(), 1000, 1, &start_fen(), &[])
+            .unwrap();
+        let parent = s.list_tasks(&p.id).unwrap().remove(0);
+        let after_e4 = Fen::from_position(
+            position_after(&parent.fen, &["e2e4".into()]).unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let unrelated = Fen::from_position(
+            position_after(&parent.fen, &["d2d4".into()]).unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        assert!(s.queue(&p.id, Some(&parent.id), &after_e4, 1).is_err());
+        s.begin_running(&p.id, "paused").unwrap();
+        s.claim(&p.id).unwrap();
+        s.save(
+            &parent.id,
+            &[DeepAnalysisLine {
+                multipv: 1,
+                depth: 8,
+                score_kind: "cp".into(),
+                score_value: 22,
+                score_perspective: "white".into(),
+                uci_moves: vec!["e2e4".into(), "e7e5".into()],
+            }],
+        )
+        .unwrap();
+        assert!(s.queue(&p.id, Some(&parent.id), &unrelated, 1).is_err());
+        assert!(s.queue(&p.id, Some(&parent.id), &parent.fen, 0).is_err());
+        let child = s.queue(&p.id, Some(&parent.id), &after_e4, 1).unwrap();
+        assert_eq!(child.parent_task_id.as_deref(), Some(parent.id.as_str()));
+    }
+    #[test]
+    fn finish_reports_newly_queued_task_for_worker_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let engine = std::env::current_exe().unwrap();
+        let p = s
+            .create_project("race", engine.to_str().unwrap(), 1000, 1, &start_fen(), &[])
+            .unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let first = s.claim(&p.id).unwrap().unwrap();
+        s.save(
+            &first.id,
+            &[parse_line("info depth 8 score cp 10 pv e2e4", &start_fen(), &[]).unwrap()],
+        )
+        .unwrap();
+        assert!(s.claim(&p.id).unwrap().is_none());
+        s.queue_root(&p.id, "startpos", 0).unwrap();
+        assert!(!s.finish(&p.id).unwrap());
+        assert!(s.claim(&p.id).unwrap().is_some());
+    }
+    #[test]
+    fn paused_project_cannot_claim_queued_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let p = s
+            .create_project(
+                "x",
+                executable.to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        assert!(s.claim(&p.id).unwrap().is_none());
+    }
+    #[test]
+    fn pv_is_validated_from_position_after_history() {
+        let fen = start_fen();
+        let parsed =
+            parse_line("info depth 8 score cp 14 pv e7e5", &fen, &["e2e4".into()]).unwrap();
+        assert_eq!(parsed.uci_moves, vec!["e7e5"]);
+        assert_eq!(parsed.score_perspective, "white");
+        assert!(parse_line("info depth 8 score cp 14 pv e2e4", &fen, &["e2e4".into()]).is_none());
+    }
+    #[test]
+    fn existing_result_table_gains_explicit_white_score_perspective() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE deep_results (task_id TEXT NOT NULL, multipv INTEGER NOT NULL, depth INTEGER NOT NULL, score_kind TEXT NOT NULL, score_value INTEGER NOT NULL, uci_moves TEXT NOT NULL, PRIMARY KEY(task_id,multipv)); INSERT INTO deep_results VALUES ('old',1,8,'cp',17,'[\"e2e4\"]');").unwrap();
+        drop(conn);
+        let s = Store::open(&path).unwrap();
+        let perspective: String = s
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT score_perspective FROM deep_results WHERE task_id='old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(perspective, "white");
+    }
+    #[test]
+    fn score_perspective_survives_running_snapshot_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let s = Store::open(&path).unwrap();
+        let p = s
+            .create_project(
+                "score",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        let task = s.list_tasks(&p.id).unwrap().remove(0);
+        s.begin_running(&p.id, "paused").unwrap();
+        s.claim(&p.id).unwrap();
+        let line = parse_line("info depth 9 score cp 18 pv e2e4", &task.fen, &task.moves).unwrap();
+        s.snapshot(&task.id, &line).unwrap();
+        drop(s);
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(reopened.list_tasks(&p.id).unwrap()[0].status, "running");
+        assert_eq!(
+            reopened.results(&p.id).unwrap()[0].lines[0].score_perspective,
+            "white"
+        );
+    }
+    #[tokio::test]
+    async fn resume_waits_for_paused_worker_to_release_single_gate() {
+        let state = DeepAnalysisState::default();
+        let old = state.acquire("first").unwrap();
+        let copy = state.active.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            drop(old);
+        });
+        let next = state.acquire_after_drain("first").await.unwrap();
+        assert_eq!(copy.lock().unwrap().as_deref(), Some("first"));
+        drop(next);
+        assert!(state.acquire("other").is_ok());
+    }
+    #[test]
+    fn launch_transition_cannot_revive_cancelled_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let p = s
+            .create_project(
+                "x",
+                executable.to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.cancel(&p.id).unwrap();
+        assert!(s.begin_running(&p.id, "paused").is_err());
+        assert_eq!(s.status(&p.id).unwrap(), "cancelled");
+    }
+    #[test]
+    fn project_and_task_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("analysis.sqlite");
+        let store = Store::open(&path).unwrap();
+        let project = store
+            .create_project(
+                "Study",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                2,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        let task = store.list_tasks(&project.id).unwrap().remove(0);
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.list_projects().unwrap()[0].id, project.id);
+        assert_eq!(store.list_tasks(&project.id).unwrap()[0].id, task.id);
+    }
+    #[test]
+    fn recovery_requeues_inflight_and_pauses_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let p = s
+            .create_project(
+                "x",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        let t = s.list_tasks(&p.id).unwrap().remove(0);
+        s.set_status(&p.id, "running").unwrap();
+        s.claim(&p.id).unwrap();
+        let line = DeepAnalysisLine {
+            multipv: 1,
+            depth: 8,
+            score_kind: "cp".into(),
+            score_value: 22,
+            score_perspective: "white".into(),
+            uci_moves: vec!["e2e4".into()],
+        };
+        s.snapshot(&t.id, &line).unwrap();
+        s.recover().unwrap();
+        assert_eq!(s.status(&p.id).unwrap(), "paused");
+        assert_eq!(s.list_tasks(&p.id).unwrap()[0].status, "queued");
+        assert_eq!(s.list_tasks(&p.id).unwrap()[0].id, t.id);
+        assert_eq!(s.progress(&p.id, None, None).unwrap().completed, 0);
+        assert_eq!(s.results(&p.id).unwrap()[0].lines[0], line);
+        assert!(s.claim(&p.id).unwrap().is_none());
+        s.begin_running(&p.id, "paused").unwrap();
+        s.claim(&p.id).unwrap();
+        let shallower = DeepAnalysisLine {
+            depth: 4,
+            ..line.clone()
+        };
+        s.snapshot(&t.id, &shallower).unwrap();
+        assert_eq!(s.results(&p.id).unwrap()[0].lines[0], line);
+        s.pause(&p.id).unwrap();
+        s.snapshot(
+            &t.id,
+            &DeepAnalysisLine {
+                depth: 12,
+                ..line.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(s.results(&p.id).unwrap()[0].lines[0], line);
+    }
+    #[test]
+    fn cancelled_task_cannot_accept_late_engine_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let p = s
+            .create_project(
+                "x",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        let t = s.list_tasks(&p.id).unwrap().remove(0);
+        s.set_status(&p.id, "running").unwrap();
+        s.claim(&p.id).unwrap();
+        s.cancel(&p.id).unwrap();
+        assert!(s
+            .save(
+                &t.id,
+                &[DeepAnalysisLine {
+                    multipv: 1,
+                    depth: 10,
+                    score_kind: "cp".into(),
+                    score_value: 10,
+                    score_perspective: "white".into(),
+                    uci_moves: vec!["e2e4".into()]
+                }]
+            )
+            .is_err());
+        assert!(s.results(&p.id).unwrap().is_empty());
+    }
+    #[test]
+    fn cancellation_marks_unfinished_tasks_and_keeps_completed_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let p = s
+            .create_project(
+                "x",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        let first = s.list_tasks(&p.id).unwrap().remove(0);
+        let second = s.queue_root(&p.id, "startpos", 0).unwrap();
+        s.set_status(&p.id, "running").unwrap();
+        s.claim(&p.id).unwrap();
+        s.save(
+            &first.id,
+            &[DeepAnalysisLine {
+                multipv: 1,
+                depth: 10,
+                score_kind: "cp".into(),
+                score_value: 12,
+                score_perspective: "white".into(),
+                uci_moves: vec!["e2e4".into()],
+            }],
+        )
+        .unwrap();
+        s.cancel(&p.id).unwrap();
+        assert_eq!(
+            s.list_tasks(&p.id)
+                .unwrap()
+                .iter()
+                .find(|t| t.id == second.id)
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        assert_eq!(s.results(&p.id).unwrap()[0].lines[0].score_value, 12);
+    }
+    #[test]
+    fn black_score_is_white_relative_without_flattening_mate() {
+        let fen = "rnbqkbnr/pppppppp/8/8/8/4P3/PPPP1PPP/RNBQKBNR b KQkq - 0 1";
+        let line = parse_line("info depth 8 multipv 1 score mate -3 pv e7e5", fen, &[]).unwrap();
+        assert_eq!(line.score_kind, "mate");
+        assert_eq!(line.score_value, 3);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_interrupts_uci_handshake_without_waiting_for_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("silent.sh");
+        let received = dir.path().join("uci-received");
+        std::fs::write(&engine, format!("#!/bin/sh\nwhile read line; do\n case \"$line\" in\n uci) touch '{}';;\n esac\ndone\n", received.display())).unwrap();
+        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let p = s
+            .create_project(
+                "handshake",
+                engine.to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let task = s.claim(&p.id).unwrap().unwrap();
+        let path = s.path.clone();
+        let project = p.clone();
+        let search = tokio::spawn(async move {
+            analyze_position(&project, &task, &Store::open(&path).unwrap()).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !received.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        s.cancel(&p.id).unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), search)
+            .await
+            .expect("cancellation must interrupt handshake")
+            .unwrap();
+        assert_eq!(outcome.unwrap_err(), "interrupted");
+        assert_eq!(s.status(&p.id).unwrap(), "cancelled");
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_pv_is_visible_while_running_and_only_bestmove_completes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("release");
+        let engine = dir.path().join("stream.sh");
+        std::fs::write(&engine, format!("#!/bin/sh\nwhile read line; do\n case \"$line\" in\n uci) echo uciok;;\n isready) echo readyok;;\n go*) echo 'info depth 8 multipv 1 score cp 34 pv e2e4 e7e5'; echo 'info depth 12 score cp 99 pv e2e5'; while [ ! -f '{}' ]; do sleep 0.02; done; echo 'bestmove e2e4';;\n quit) exit 0;;\n esac\ndone\n", release.display())).unwrap();
+        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.path().join("db");
+        let s = Store::open(&path).unwrap();
+        let p = s
+            .create_project(
+                "stream",
+                engine.to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let task = s.claim(&p.id).unwrap().unwrap();
+        let other = Store::open(&path).unwrap();
+        let project = p.clone();
+        let running_task = task.clone();
+        let search =
+            tokio::spawn(async move { analyze_position(&project, &running_task, &other).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if !s.results(&p.id).unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(s.list_tasks(&p.id).unwrap()[0].status, "running");
+        assert_eq!(s.progress(&p.id, None, None).unwrap().completed, 0);
+        let snapshot = &s.results(&p.id).unwrap()[0].lines[0];
+        assert_eq!(
+            (
+                snapshot.depth,
+                snapshot.score_value,
+                snapshot.uci_moves.as_slice()
+            ),
+            (8, 34, &["e2e4".to_string(), "e7e5".to_string()][..])
+        );
+        std::fs::write(&release, "release").unwrap();
+        let lines = search.await.unwrap().unwrap();
+        assert_eq!(s.list_tasks(&p.id).unwrap()[0].status, "running");
+        s.save(&task.id, &lines).unwrap();
+        assert_eq!(s.progress(&p.id, None, None).unwrap().completed, 1);
+        let reopened = Store::open(&path).unwrap();
+        reopened.recover().unwrap();
+        assert_eq!(reopened.list_tasks(&p.id).unwrap()[0].status, "completed");
+        assert_eq!(reopened.results(&p.id).unwrap()[0].lines[0].depth, 8);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pause_stops_search_preserves_snapshot_and_blocks_next_task() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stopped = dir.path().join("stopped");
+        let engine = dir.path().join("pause.sh");
+        std::fs::write(&engine, format!("#!/bin/sh\nwhile read line; do\n case \"$line\" in\n uci) echo uciok;;\n isready) echo readyok;;\n go*) echo 'info depth 8 score mate 3 pv e2e4';;\n stop) touch '{}'; echo 'bestmove e2e4';;\n quit) exit 0;;\n esac\ndone\n", stopped.display())).unwrap();
+        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.path().join("db");
+        let s = Store::open(&path).unwrap();
+        let p = s
+            .create_project(
+                "pause",
+                engine.to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.queue_root(&p.id, "startpos", 0).unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let task = s.claim(&p.id).unwrap().unwrap();
+        let other = Store::open(&path).unwrap();
+        let project = p.clone();
+        let search = tokio::spawn(async move { analyze_position(&project, &task, &other).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while s.results(&p.id).unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        s.pause(&p.id).unwrap();
+        assert!(search.await.unwrap().is_err());
+        assert!(stopped.exists());
+        assert_eq!(s.status(&p.id).unwrap(), "paused");
+        assert!(s
+            .list_tasks(&p.id)
+            .unwrap()
+            .iter()
+            .all(|t| t.status == "queued"));
+        assert!(s.claim(&p.id).unwrap().is_none());
+        assert_eq!(s.progress(&p.id, None, None).unwrap().completed, 0);
+        let reopened = Store::open(&path).unwrap();
+        reopened.recover().unwrap();
+        assert_eq!(
+            reopened.results(&p.id).unwrap()[0].lines[0].score_kind,
+            "mate"
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn engine_exit_after_scored_pv_leaves_task_failed_not_completed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("exit.sh");
+        std::fs::write(&engine, "#!/bin/sh\nwhile read line; do\n case \"$line\" in\n uci) echo uciok;;\n isready) echo readyok;;\n go*) echo 'info depth 8 score cp 34 pv e2e4'; exit 0;;\n esac\ndone\n").unwrap();
+        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let p = s
+            .create_project(
+                "failure",
+                engine.to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let task = s.claim(&p.id).unwrap().unwrap();
+        let err = analyze_position(&p, &task, &s).await.unwrap_err();
+        s.fail(&task.id, &err).unwrap();
+        assert_eq!(s.list_tasks(&p.id).unwrap()[0].status, "failed");
+        assert_eq!(s.progress(&p.id, None, None).unwrap().completed, 0);
+        assert_eq!(s.results(&p.id).unwrap()[0].lines[0].score_value, 34);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_persists_real_uci_output_and_finishes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("fake-engine.sh");
+        std::fs::write(&engine,"#!/bin/sh\nwhile read line; do\n case \"$line\" in\n uci) echo uciok;;\n isready) echo readyok;;\n go\\ movetime\\ 1000) echo 'info depth 8 multipv 1 score cp 34 pv e2e4 e7e5'; echo 'bestmove e2e4';;\n quit) exit 0;;\n esac\ndone\n").unwrap();
+        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let p = s
+            .create_project("x", engine.to_str().unwrap(), 1000, 1, &start_fen(), &[])
+            .unwrap();
+        let task = s.list_tasks(&p.id).unwrap().remove(0);
+        s.set_status(&p.id, "running").unwrap();
+        s.claim(&p.id).unwrap();
+        let lines = analyze_position(&p, &task, &s).await.unwrap();
+        s.save(&task.id, &lines).unwrap();
+        assert_eq!(
+            s.results(&p.id).unwrap()[0].lines[0].uci_moves,
+            vec!["e2e4", "e7e5"]
+        );
+    }
+    #[test]
+    fn rejects_invalid_pv_and_preserves_mate_score_kind() {
+        let fen = start_fen();
+        assert!(parse_line("info depth 12 score cp 20 pv e2e5", &fen, &[]).is_none());
+        assert!(parse_line("info depth 12 pv e2e4", &fen, &[]).is_none());
+        let line = parse_line(
+            "info depth 12 multipv 1 score mate 3 pv e2e4 e7e5",
+            &fen,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(line.score_kind, "mate");
+        assert_eq!(line.score_value, 3);
+        assert_eq!(line.uci_moves, vec!["e2e4", "e7e5"]);
+    }
+}

@@ -78,6 +78,9 @@ describe("application command registry", () => {
 
     expect(analysisCommand?.label).toBe("Analysis");
     expect(analysisCommand?.description).toBe("Open Analysis");
+    const deepCommand = commands.find((command) => command.id === "nav.deepAnalysis");
+    expect(deepCommand?.label).toBe("Deep Analysis");
+    expect(deepCommand?.description).toBe("Open Deep Analysis");
   });
 
   test("reflects engine state in labels and disabled commands", () => {
