@@ -1,0 +1,34 @@
+# Aquarium-inspired Interactive Deep Analysis (IDeA) roadmap
+
+Reference: ChessOK's [Aquarium manual](https://shop.chessok.com/manuals/manuals/Aquarium.pdf), especially pp. 36–53 (IDeA) and 64–65 (feeding infinite analysis into IDeA). This is a plan for equivalent user-facing capabilities, not a claim to reproduce ChessOK's proprietary scheduling heuristics, file formats, or UI assets.
+
+## Where the fork stands
+
+The `feature/deep-analysis` branch already adds a separate Deep Analysis page, persistent SQLite projects/tasks/results, a local UCI engine worker, MultiPV snapshots, progress polling, and start/pause/resume/cancel. It stores a root position and permits manually queued positions. Existing Rust tests exercise persistence, interruptions, legal PVs, and cancellation; the frontend has focused UI and service tests.
+
+This is a **position queue**, not IDeA yet: it does not automatically expand a position tree, back up minimaxed scores, choose continuations from the tree, render a board-linked analysis tree, or let the user steer moves in that tree. The backend has a continuation command, but the frontend service/page does not expose it. The existing worker runs one project/engine at a time. Keep this branch as the foundation; do not describe it as feature-complete or merge it merely because the basic queue works.
+
+## Target behavior, in order
+
+1. **Persistent analysis tree and correct evaluations.** For each project/root, store move edges, positions, direct engine evaluations, minimaxed evaluations, depths, PVs, and provenance separately. Link transpositions for browsing but retain the full root-to-task move history for repetition and fifty-move-rule correctness. Store centipawn and mate scores as distinct types; keep an explicit score perspective. Migrate existing `deep-analysis.sqlite` data without dropping prior tasks/results. Reuse the existing SQLite store and UCI parser rather than inventing a second engine layer. (Manual pp. 36–37, 50–51.)
+
+2. **Minimax before automated selection.** Recompute scores up the changed paths whenever a result or user edit lands: White selects the highest white-relative score, Black the lowest. Define ordering of mate scores, unknown branches, terminal draws/mates, and ties. Handle transpositions and cycles without recursive loops; retain both direct and minimaxed scores so a temporary leaf evaluation is never mistaken for a proved root value. Expose “Minimax now” for a complete rebuild. (Manual pp. 39, 42, 44, 50.)
+
+3. **Automatic, bounded tree expansion.** Make an explicit `automatic expansion` project setting (off = analyze only supplied positions; on = generate follow-up work). Begin with one active root and one local engine. Feed legal PV continuations and candidate alternatives into a deduplicated, persistent priority queue. At each stage select promising branches by minimaxed score and depth while enforcing max variation length, per-side alternative limits, tree width, and project score bounds; never enqueue unlimited PV tails. A manually requested task takes priority. Preserve queue/stage state on stop, restart, and app crash. Add a bounded “false alarm” extension for a new move that initially looks better, before assigning it more work. (Manual pp. 36–37, 44–46, 49–53.)
+
+4. **Make the “Interactive” part usable.** Add a board-linked tree/notation view in the existing workbench: click an edge to show its board position, score/depth and PV; display live running/queued/completed tasks and stage progress. Allow queueing the current board position, an unexplored legal move, or a continuation of a completed PV. Persist green (only analyze marked moves) and red (exclude marked moves) user choices; apply them to future scheduling, not just display. Permit reprioritizing and removing queued tasks without corrupting the tree. Reuse existing board/notation components; keep large tree data in SQLite rather than the sessionStorage-backed game tab state. (Manual pp. 46–53.)
+
+5. **Project controls and deeper parity after the core works.** Multiple enabled roots with per-root comments and fair scheduling; edit project settings without losing results; preferred side, thematic moves, analysis time/depth/max-time and “wait for next depth”; additional local engine instances and a global CPU budget across projects. Then consider EPD task/result import, PGN/tree export, a shared master tree, linked infinite-analysis PV ingestion, and backup/restore. Remote engines and Aquarium scripting/file-format compatibility are separate, opt-in projects, not launch blockers. (Manual pp. 37–46, 52–53, 64–65.)
+
+## Deliverable milestones and checks
+
+- **M1 — Tree + migration + minimax:** a stored two-ply example correctly chooses White's maximum and Black's minimum; mate and draw tests; transposition and repetition tests; old projects/results still open after migration; app restart preserves direct/minimax scores.
+- **M2 — Self-running IDeA:** from one FEN and a registered local UCI engine, Start analyzes the root and creates/analyzes at least one legal continuation and an alternative without manual FEN entry; queue remains finite at the configured ply/branch budget; pause/resume and crash recovery neither lose nor duplicate work. Test with a deterministic fake UCI engine and, when available, a real Stockfish binary.
+- **M3 — Steering and live view:** user navigates board ↔ tree ↔ notation during analysis; green/red choices and manual high-priority tasks demonstrably change the next claimed task; streaming PV, depth, task state, error and progress remain visible after restart. Add UI tests and a hands-on Tauri smoke test.
+- **M4 — Broader Aquarium parity:** multiple roots/projects/engines and advanced controls each get focused fairness, correctness, and persistence tests before enabling them by default. Only then evaluate imports, shared trees, and remote execution.
+
+For every milestone run frontend tests/typecheck and Rust tests/clippy/fmt on a machine with the toolchain; test Tauri UI with an installed local engine. Keep the existing analysis board and game database unaffected. The first public feature should be described as “Aquarium-inspired IDeA,” not exact algorithmic or file-format compatibility.
+
+## Planning baseline (12 October 2026)
+
+On this checkout, 20 focused Deep Analysis frontend tests pass when Node 26 is given `NODE_OPTIONS=--localstorage-file=<scratch path>`; TypeScript `tsc --noEmit` passes. Without that flag, one navigation suite fails during import because `localStorage` is unavailable in this Node environment. Cargo/Rust is not installed here, so the existing Rust tests and an actual Tauri engine/board smoke test are **not yet verified** on this machine. Do not infer backend runtime correctness from the frontend checks.
