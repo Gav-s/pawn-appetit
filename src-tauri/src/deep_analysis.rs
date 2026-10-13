@@ -17,6 +17,9 @@ use tauri::{path::BaseDirectory, Manager};
 use tauri_specta::Event;
 use vampirc_uci::{parse_one, uci::ScoreValue, UciInfoAttribute, UciMessage};
 
+#[path = "deep_analysis_tree.rs"]
+mod tree;
+
 // A separate file avoids changing the game database schema or competing with its connection pool.
 fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path()
@@ -144,7 +147,7 @@ impl Store {
         let store = Self {
             path: path.to_owned(),
         };
-        let conn = store.conn()?;
+        let mut conn = store.conn()?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS deep_projects (
             id TEXT PRIMARY KEY, title TEXT NOT NULL, engine TEXT NOT NULL, depth INTEGER NOT NULL DEFAULT 0, time_ms INTEGER NOT NULL DEFAULT 1000,
             multipv INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'paused',
@@ -197,6 +200,8 @@ impl Store {
             conn.execute_batch("ALTER TABLE deep_results ADD COLUMN score_perspective TEXT NOT NULL DEFAULT 'white'")
                 .map_err(|e| e.to_string())?;
         }
+        tree::create_schema(&conn)?;
+        tree::backfill_legacy(&mut conn)?;
         Ok(store)
     }
     fn conn(&self) -> Result<Connection, String> {
@@ -281,6 +286,32 @@ impl Store {
         fen: &str,
         ply: u32,
     ) -> Result<DeepAnalysisTask, String> {
+        self.queue_with_occurrence(project_id, parent_task_id, fen, ply, None)
+    }
+    fn queue_at_occurrence(
+        &self,
+        project_id: &str,
+        parent_task_id: &str,
+        fen: &str,
+        ply: u32,
+        occurrence_id: i64,
+    ) -> Result<DeepAnalysisTask, String> {
+        self.queue_with_occurrence(
+            project_id,
+            Some(parent_task_id),
+            fen,
+            ply,
+            Some(occurrence_id),
+        )
+    }
+    fn queue_with_occurrence(
+        &self,
+        project_id: &str,
+        parent_task_id: Option<&str>,
+        fen: &str,
+        ply: u32,
+        occurrence_id: Option<i64>,
+    ) -> Result<DeepAnalysisTask, String> {
         let normalized = if fen == "startpos" {
             start_fen()
         } else {
@@ -290,7 +321,10 @@ impl Store {
         if self.get_project(project_id)?.is_none() {
             return Err("project not found".into());
         }
-        if let Some(parent) = parent_task_id {
+        if occurrence_id.is_some() && parent_task_id.is_none() {
+            return Err("root tasks cannot select a continuation occurrence".into());
+        }
+        let resolved_occurrence = if let Some(parent) = parent_task_id {
             let parent = self
                 .list_tasks(project_id)?
                 .into_iter()
@@ -326,16 +360,35 @@ impl Store {
             if !descendant {
                 return Err("continuation must follow a completed parent PV".into());
             }
-        }
+            let conn = self.conn()?;
+            Some(tree::resolve_occurrence(
+                &conn,
+                project_id,
+                &parent.id,
+                &normalized,
+                ply,
+                occurrence_id,
+            )?)
+        } else {
+            None
+        };
         let id = uuid::Uuid::new_v4().to_string();
         if self
             .conn()?
             .execute(
-                "INSERT INTO deep_tasks(id,project_id,parent_task_id,fen,moves,ply)
-            SELECT ?1,?2,?3,?4,?5,?6 WHERE EXISTS (
+                "INSERT INTO deep_tasks(id,project_id,parent_task_id,fen,moves,ply,occurrence_id)
+            SELECT ?1,?2,?3,?4,?5,?6,?7 WHERE EXISTS (
                 SELECT 1 FROM deep_projects WHERE id=?2 AND status!='cancelled'
             )",
-                params![id, project_id, parent_task_id, normalized, "[]", ply],
+                params![
+                    id,
+                    project_id,
+                    parent_task_id,
+                    normalized,
+                    "[]",
+                    ply,
+                    resolved_occurrence
+                ],
             )
             .map_err(|e| e.to_string())?
             == 0
@@ -572,6 +625,7 @@ impl Store {
         for line in lines {
             tx.execute("INSERT INTO deep_results(task_id,multipv,depth,score_kind,score_value,score_perspective,uci_moves) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![task_id,line.multipv,line.depth,line.score_kind,line.score_value,line.score_perspective,serde_json::to_string(&line.uci_moves).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
         }
+        tree::store_completed(&tx, task_id, lines)?;
         tx.execute(
             "UPDATE deep_tasks SET status='completed' WHERE id=?1",
             [task_id],
@@ -778,8 +832,13 @@ pub fn queue_deep_analysis_continuation(
     parent_task_id: String,
     fen: String,
     ply: u32,
+    occurrence_id: Option<i64>,
 ) -> Result<DeepAnalysisTask, String> {
-    store(&app)?.queue(&project_id, Some(&parent_task_id), &fen, ply)
+    let s = store(&app)?;
+    match occurrence_id {
+        Some(id) => s.queue_at_occurrence(&project_id, &parent_task_id, &fen, ply, id),
+        None => s.queue(&project_id, Some(&parent_task_id), &fen, ply),
+    }
 }
 #[tauri::command]
 #[specta::specta]
@@ -1742,5 +1801,1007 @@ mod tests {
         assert_eq!(line.score_kind, "mate");
         assert_eq!(line.score_value, 3);
         assert_eq!(line.uci_moves, vec!["e2e4", "e7e5"]);
+    }
+    #[test]
+    fn completed_pv_persists_a_legal_position_path_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("analysis.sqlite");
+        let s = Store::open(&path).unwrap();
+        let p = s
+            .create_project(
+                "tree",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let task = s.claim(&p.id).unwrap().unwrap();
+        let line = parse_line(
+            "info depth 8 score cp 34 pv e2e4 e7e5",
+            &task.fen,
+            &task.moves,
+        )
+        .unwrap();
+        s.save(&task.id, &[line]).unwrap();
+        drop(s);
+        let reopened = Store::open(&path).unwrap();
+        let conn = reopened.conn().unwrap();
+        let mut statement = conn.prepare("SELECT id,parent_id,move_uci,fen,history,direct_score_kind,direct_score_value FROM deep_tree_nodes WHERE project_id=?1 ORDER BY ply,id").unwrap();
+        let nodes: Vec<_> = statement
+            .query_map([&p.id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i32>>(6)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[0].1, None);
+        assert_eq!(nodes[0].2, None);
+        assert_eq!(nodes[0].3, start_fen());
+        assert_eq!(nodes[0].4, "[]");
+        assert_eq!(nodes[0].5.as_deref(), Some("cp"));
+        assert_eq!(nodes[0].6, Some(34));
+        assert_eq!(nodes[1].1, Some(nodes[0].0));
+        assert_eq!(nodes[1].2.as_deref(), Some("e2e4"));
+        assert_eq!(nodes[1].4, "[\"e2e4\"]");
+        assert_eq!(nodes[2].1, Some(nodes[1].0));
+        assert_eq!(nodes[2].2.as_deref(), Some("e7e5"));
+        assert_eq!(nodes[2].4, "[\"e2e4\",\"e7e5\"]");
+        assert_eq!(
+            nodes[2].3,
+            Fen::from_position(
+                position_after(&start_fen(), &["e2e4".into(), "e7e5".into()]).unwrap(),
+                EnPassantMode::Legal
+            )
+            .to_string()
+        );
+    }
+    #[test]
+    fn minimax_prefers_the_higher_scored_child_for_white_and_keeps_direct_score() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let s = Store::open(&path).unwrap();
+        let p = s
+            .create_project(
+                "white",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                2,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let root = s.claim(&p.id).unwrap().unwrap();
+        s.save(
+            &root.id,
+            &[
+                parse_line(
+                    "info depth 8 multipv 1 score cp 30 pv e2e4 e7e5",
+                    &root.fen,
+                    &[],
+                )
+                .unwrap(),
+                parse_line(
+                    "info depth 8 multipv 2 score cp 28 pv d2d4 d7d5",
+                    &root.fen,
+                    &[],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        for (first_move, response, black_score) in [("e2e4", "e7e5", -10), ("d2d4", "d7d5", -15)] {
+            let fen = Fen::from_position(
+                position_after(&start_fen(), &[first_move.into()]).unwrap(),
+                EnPassantMode::Legal,
+            )
+            .to_string();
+            s.queue(&p.id, Some(&root.id), &fen, 1).unwrap();
+            let child = s.claim(&p.id).unwrap().unwrap();
+            assert_eq!(child.fen, fen);
+            let line = parse_line(
+                &format!("info depth 8 score cp {black_score} pv {response}"),
+                &child.fen,
+                &[],
+            )
+            .unwrap();
+            s.save(&child.id, &[line]).unwrap();
+        }
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        let scores: (i32, i32) = s.conn().unwrap().query_row(
+            "SELECT direct_score_value,minimax_score_value FROM deep_tree_nodes WHERE analyzed_task_id=?1",
+            [&root.id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(scores, (30, 15));
+    }
+    #[test]
+    fn black_minimax_backs_up_through_a_reused_pv_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let p = s
+            .create_project(
+                "black",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                2,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let root = s.claim(&p.id).unwrap().unwrap();
+        s.save(
+            &root.id,
+            &[
+                parse_line(
+                    "info depth 8 multipv 1 score cp 30 pv e2e4 e7e5",
+                    &root.fen,
+                    &[],
+                )
+                .unwrap(),
+                parse_line(
+                    "info depth 8 multipv 2 score cp 28 pv d2d4 d7d5",
+                    &root.fen,
+                    &[],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let e4_fen = Fen::from_position(
+            position_after(&start_fen(), &["e2e4".into()]).unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        s.queue(&p.id, Some(&root.id), &e4_fen, 1).unwrap();
+        let e4_task = s.claim(&p.id).unwrap().unwrap();
+        s.save(
+            &e4_task.id,
+            &[
+                parse_line("info depth 8 multipv 1 score cp -20 pv e7e5", &e4_fen, &[]).unwrap(),
+                parse_line("info depth 8 multipv 2 score cp -25 pv e7e6", &e4_fen, &[]).unwrap(),
+            ],
+        )
+        .unwrap();
+        for (reply, white_score) in [("e7e5", 5), ("e7e6", 25)] {
+            let fen = Fen::from_position(
+                position_after(&start_fen(), &["e2e4".into(), reply.into()]).unwrap(),
+                EnPassantMode::Legal,
+            )
+            .to_string();
+            s.queue(&p.id, Some(&e4_task.id), &fen, 2).unwrap();
+            let task = s.claim(&p.id).unwrap().unwrap();
+            let line = parse_line(
+                &format!("info depth 8 score cp {white_score} pv g1f3"),
+                &fen,
+                &[],
+            )
+            .unwrap();
+            s.save(&task.id, &[line]).unwrap();
+        }
+        let conn = s.conn().unwrap();
+        let e4: (i32, i32) = conn.query_row("SELECT direct_score_value,minimax_score_value FROM deep_tree_nodes WHERE analyzed_task_id=?1", [&e4_task.id], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        let root_score: i32 = conn
+            .query_row(
+                "SELECT minimax_score_value FROM deep_tree_nodes WHERE analyzed_task_id=?1",
+                [&root.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(e4, (20, 5));
+        assert_eq!(root_score, 5);
+    }
+    #[test]
+    fn transposed_pvs_need_an_exact_occurrence_to_queue_a_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let p = s
+            .create_project(
+                "transpose",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                2,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let root = s.claim(&p.id).unwrap().unwrap();
+        let a = "g1f3 g8f6 b1c3 b8c6";
+        let b = "b1c3 b8c6 g1f3 g8f6";
+        s.save(
+            &root.id,
+            &[
+                parse_line(
+                    &format!("info depth 8 multipv 1 score cp 20 pv {a}"),
+                    &root.fen,
+                    &[],
+                )
+                .unwrap(),
+                parse_line(
+                    &format!("info depth 8 multipv 2 score cp 30 pv {b}"),
+                    &root.fen,
+                    &[],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let path_a: Vec<String> = a.split_whitespace().map(str::to_owned).collect();
+        let path_b: Vec<String> = b.split_whitespace().map(str::to_owned).collect();
+        let fen_a = Fen::from_position(
+            position_after(&root.fen, &path_a).unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let fen_b = Fen::from_position(
+            position_after(&root.fen, &path_b).unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        assert_eq!(fen_a, fen_b);
+        let err = s.queue(&p.id, Some(&root.id), &fen_a, 4).unwrap_err();
+        assert!(err.contains("ambiguous"), "{err}");
+        assert_eq!(s.list_tasks(&p.id).unwrap().len(), 1);
+    }
+    #[test]
+    fn explicit_transposed_occurrence_attaches_only_to_the_chosen_move_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let s = Store::open(&path).unwrap();
+        let p = s
+            .create_project(
+                "transpose",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                2,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let root = s.claim(&p.id).unwrap().unwrap();
+        let a = "g1f3 g8f6 b1c3 b8c6";
+        let b = "b1c3 b8c6 g1f3 g8f6";
+        s.save(
+            &root.id,
+            &[
+                parse_line(
+                    &format!("info depth 8 multipv 1 score cp 20 pv {a}"),
+                    &root.fen,
+                    &[],
+                )
+                .unwrap(),
+                parse_line(
+                    &format!("info depth 8 multipv 2 score cp 30 pv {b}"),
+                    &root.fen,
+                    &[],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let path_a: Vec<String> = a.split_whitespace().map(str::to_owned).collect();
+        let path_b: Vec<String> = b.split_whitespace().map(str::to_owned).collect();
+        let fen = Fen::from_position(
+            position_after(&root.fen, &path_b).unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let conn = s.conn().unwrap();
+        let occurrence_b: i64 = conn
+            .query_row(
+                "SELECT id FROM deep_tree_nodes WHERE project_id=?1 AND history=?2",
+                params![p.id, serde_json::to_string(&path_b).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let occurrence_a: i64 = conn
+            .query_row(
+                "SELECT id FROM deep_tree_nodes WHERE project_id=?1 AND history=?2",
+                params![p.id, serde_json::to_string(&path_a).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        let child = s
+            .queue_at_occurrence(&p.id, &root.id, &fen, 4, occurrence_b)
+            .unwrap();
+        let claimed = s.claim(&p.id).unwrap().unwrap();
+        assert_eq!(claimed.id, child.id);
+        let line = parse_line("info depth 8 score cp 55 pv e2e4", &claimed.fen, &[]).unwrap();
+        s.save(&child.id, &[line]).unwrap();
+        drop(s);
+        let reopened = Store::open(&path).unwrap();
+        let conn = reopened.conn().unwrap();
+        let task_occurrence: i64 = conn
+            .query_row(
+                "SELECT occurrence_id FROM deep_tasks WHERE id=?1",
+                [&child.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(task_occurrence, occurrence_b);
+        let scored: i64 = conn
+            .query_row(
+                "SELECT id FROM deep_tree_nodes WHERE analyzed_task_id=?1",
+                [&child.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scored, occurrence_b);
+        let wrong_branch_score: Option<i32> = conn
+            .query_row(
+                "SELECT direct_score_value FROM deep_tree_nodes WHERE id=?1",
+                [occurrence_a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong_branch_score, None);
+        assert_eq!(reopened.results(&p.id).unwrap().len(), 2);
+    }
+    #[test]
+    fn duplicate_analysis_keeps_both_task_links_and_stable_latest_score_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let s = Store::open(&path).unwrap();
+        let p = s
+            .create_project(
+                "duplicates",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let root = s.claim(&p.id).unwrap().unwrap();
+        s.save(
+            &root.id,
+            &[parse_line("info depth 8 score cp 30 pv e2e4", &root.fen, &[]).unwrap()],
+        )
+        .unwrap();
+        let fen = Fen::from_position(
+            position_after(&root.fen, &["e2e4".into()]).unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let mut task_ids = vec![];
+        for (score, reply) in [(-10, "e7e5"), (-20, "e7e6")] {
+            let task = s.queue(&p.id, Some(&root.id), &fen, 1).unwrap();
+            s.claim(&p.id).unwrap();
+            s.save(
+                &task.id,
+                &[parse_line(
+                    &format!("info depth 8 score cp {score} pv {reply}"),
+                    &fen,
+                    &[],
+                )
+                .unwrap()],
+            )
+            .unwrap();
+            task_ids.push(task.id);
+        }
+        drop(s);
+        for _ in 0..2 {
+            let reopened = Store::open(&path).unwrap();
+            let conn = reopened.conn().unwrap();
+            let links: Vec<(String, i64)> = {
+                let mut stmt = conn.prepare("SELECT task_id,node_id FROM deep_tree_analyses WHERE task_id IN (?1,?2) ORDER BY task_id").unwrap();
+                stmt.query_map(params![task_ids[0], task_ids[1]], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+            };
+            assert_eq!(links.len(), 2);
+            assert_eq!(links[0].1, links[1].1);
+            let score: i32 = conn
+                .query_row(
+                    "SELECT direct_score_value FROM deep_tree_nodes WHERE id=?1",
+                    [links[0].1],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(score, 20);
+            let score_source: String = conn
+                .query_row(
+                    "SELECT analyzed_task_id FROM deep_tree_nodes WHERE id=?1",
+                    [links[0].1],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(score_source, task_ids[1]);
+            let results = reopened.results(&p.id).unwrap();
+            assert_eq!(results.len(), 3);
+            assert_eq!(results[1].lines[0].score_value, 10);
+            assert_eq!(results[2].lines[0].score_value, 20);
+        }
+    }
+    #[test]
+    fn ambiguous_legacy_continuation_is_deferred_without_losing_results_or_blocking_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite");
+        let s = Store::open(&path).unwrap();
+        let p = s
+            .create_project(
+                "legacy",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                2,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let root = s.claim(&p.id).unwrap().unwrap();
+        let a = "g1f3 g8f6 b1c3 b8c6";
+        let b = "b1c3 b8c6 g1f3 g8f6";
+        s.save(
+            &root.id,
+            &[
+                parse_line(
+                    &format!("info depth 8 multipv 1 score cp 20 pv {a}"),
+                    &root.fen,
+                    &[],
+                )
+                .unwrap(),
+                parse_line(
+                    &format!("info depth 8 multipv 2 score cp 30 pv {b}"),
+                    &root.fen,
+                    &[],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let path_a: Vec<String> = a.split_whitespace().map(str::to_owned).collect();
+        let fen = Fen::from_position(
+            position_after(&root.fen, &path_a).unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let child_id = uuid::Uuid::new_v4().to_string();
+        let conn = s.conn().unwrap();
+        conn.execute(
+            "INSERT INTO deep_tasks(id,project_id,parent_task_id,fen,moves,ply,status)
+            VALUES(?1,?2,?3,?4,'[]',4,'completed')",
+            params![child_id, p.id, root.id, fen],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO deep_results(task_id,multipv,depth,score_kind,score_value,score_perspective,uci_moves)
+            VALUES(?1,1,8,'cp',77,'white','[\"e2e4\"]')", [&child_id]).unwrap();
+        conn.execute(
+            "UPDATE deep_tasks SET occurrence_id=NULL WHERE id=?1",
+            [&root.id],
+        )
+        .unwrap();
+        conn.execute_batch("DROP TABLE deep_tree_analyses; DROP TABLE deep_tree_nodes;")
+            .unwrap();
+        drop(conn);
+        drop(s);
+        for _ in 0..2 {
+            let reopened =
+                Store::open(&path).expect("ambiguous legacy data must not block project open");
+            let conn = reopened.conn().unwrap();
+            let reason: String = conn
+                .query_row(
+                    "SELECT reason FROM deep_tree_backfill_deferred WHERE task_id=?1",
+                    [&child_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(reason.contains("ambiguous"), "{reason}");
+            let links: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM deep_tree_analyses WHERE task_id=?1",
+                    [&child_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(links, 0);
+            let nodes: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM deep_tree_nodes WHERE project_id=?1",
+                    [&p.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(nodes, 9);
+            let results = reopened.results(&p.id).unwrap();
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[1].lines[0].score_value, 77);
+            assert_eq!(reopened.list_tasks(&p.id).unwrap()[1].status, "completed");
+        }
+    }
+    #[test]
+    fn migration_does_not_keep_an_old_guessed_transposition_link_or_score() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite");
+        let s = Store::open(&path).unwrap();
+        let p = s
+            .create_project(
+                "old-tree",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                2,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let root = s.claim(&p.id).unwrap().unwrap();
+        let a = "g1f3 g8f6 b1c3 b8c6";
+        let b = "b1c3 b8c6 g1f3 g8f6";
+        s.save(
+            &root.id,
+            &[
+                parse_line(
+                    &format!("info depth 8 multipv 1 score cp 20 pv {a}"),
+                    &root.fen,
+                    &[],
+                )
+                .unwrap(),
+                parse_line(
+                    &format!("info depth 8 multipv 2 score cp 30 pv {b}"),
+                    &root.fen,
+                    &[],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let path_a: Vec<String> = a.split_whitespace().map(str::to_owned).collect();
+        let fen = Fen::from_position(
+            position_after(&root.fen, &path_a).unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let child_id = uuid::Uuid::new_v4().to_string();
+        let conn = s.conn().unwrap();
+        conn.execute(
+            "INSERT INTO deep_tasks(id,project_id,parent_task_id,fen,moves,ply,status)
+            VALUES(?1,?2,?3,?4,'[]',4,'completed')",
+            params![child_id, p.id, root.id, fen],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO deep_results(task_id,multipv,depth,score_kind,score_value,score_perspective,uci_moves)
+            VALUES(?1,1,8,'cp',77,'white','[\"e2e4\"]')", [&child_id]).unwrap();
+        let a_id: i64 = conn
+            .query_row(
+                "SELECT id FROM deep_tree_nodes WHERE project_id=?1 AND history=?2",
+                params![p.id, serde_json::to_string(&path_a).unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute("UPDATE deep_tree_nodes SET analyzed_task_id=?1,direct_score_kind='cp',direct_score_value=77,
+            minimax_score_kind='cp',minimax_score_value=77 WHERE id=?2", params![child_id,a_id]).unwrap();
+        conn.execute_batch(
+            "DROP TABLE deep_tree_analyses; DROP TABLE deep_tree_backfill_deferred;",
+        )
+        .unwrap();
+        drop(conn);
+        drop(s);
+        let reopened = Store::open(&path).unwrap();
+        let conn = reopened.conn().unwrap();
+        let (old_pointer, old_score): (Option<String>, Option<i32>) = conn
+            .query_row(
+                "SELECT analyzed_task_id,direct_score_value FROM deep_tree_nodes WHERE id=?1",
+                [a_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((old_pointer, old_score), (None, None));
+        let root_minimax: i32 = conn
+            .query_row(
+                "SELECT minimax_score_value FROM deep_tree_nodes WHERE analyzed_task_id=?1",
+                [&root.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(root_minimax, 20);
+        assert_eq!(reopened.results(&p.id).unwrap()[1].lines[0].score_value, 77);
+    }
+    #[test]
+    fn legacy_duplicate_results_relink_to_one_occurrence_once_without_oscillating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite");
+        let s = Store::open(&path).unwrap();
+        let p = s
+            .create_project(
+                "legacy-duplicates",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let root = s.claim(&p.id).unwrap().unwrap();
+        s.save(
+            &root.id,
+            &[parse_line("info depth 8 score cp 30 pv e2e4", &root.fen, &[]).unwrap()],
+        )
+        .unwrap();
+        let fen = Fen::from_position(
+            position_after(&root.fen, &["e2e4".into()]).unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let mut task_ids = Vec::new();
+        for (score, move_uci) in [(-10, "e7e5"), (-20, "e7e6")] {
+            let child = s.queue(&p.id, Some(&root.id), &fen, 1).unwrap();
+            s.claim(&p.id).unwrap();
+            s.save(
+                &child.id,
+                &[parse_line(
+                    &format!("info depth 8 score cp {score} pv {move_uci}"),
+                    &fen,
+                    &[],
+                )
+                .unwrap()],
+            )
+            .unwrap();
+            task_ids.push(child.id);
+        }
+        let conn = s.conn().unwrap();
+        let node_id: i64 = conn
+            .query_row(
+                "SELECT node_id FROM deep_tree_analyses WHERE task_id=?1",
+                [&task_ids[0]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE deep_tree_nodes SET analyzed_task_id=?1 WHERE id=?2",
+            params![task_ids[1], node_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE deep_tasks SET occurrence_id=NULL WHERE id IN (?1,?2)",
+            params![task_ids[0], task_ids[1]],
+        )
+        .unwrap();
+        conn.execute_batch("DROP TABLE deep_tree_analyses;")
+            .unwrap();
+        drop(conn);
+        drop(s);
+        for _ in 0..2 {
+            let reopened = Store::open(&path).unwrap();
+            let conn = reopened.conn().unwrap();
+            for task_id in &task_ids {
+                let (mapped_node, task_occurrence): (i64, i64) = conn
+                    .query_row(
+                        "SELECT a.node_id,t.occurrence_id FROM deep_tree_analyses a
+                     JOIN deep_tasks t ON t.id=a.task_id WHERE a.task_id=?1",
+                        [task_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!((mapped_node, task_occurrence), (node_id, node_id));
+            }
+            let score: i32 = conn
+                .query_row(
+                    "SELECT direct_score_value FROM deep_tree_nodes WHERE id=?1",
+                    [node_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(score, 20);
+            assert_eq!(reopened.results(&p.id).unwrap().len(), 3);
+        }
+    }
+    #[test]
+    fn explicit_occurrence_must_follow_the_named_parent_tasks_own_pv() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let p = s
+            .create_project(
+                "branch",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let root = s.claim(&p.id).unwrap().unwrap();
+        s.save(
+            &root.id,
+            &[parse_line(
+                "info depth 8 score cp 20 pv g1f3 g8f6 b1c3 b8c6",
+                &root.fen,
+                &[],
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let first_fen = Fen::from_position(
+            position_after(&root.fen, &["g1f3".into()]).unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let child = s.queue(&p.id, Some(&root.id), &first_fen, 1).unwrap();
+        s.claim(&p.id).unwrap();
+        s.save(
+            &child.id,
+            &[parse_line(
+                "info depth 8 score cp -10 pv b8c6 b1c3 g8f6",
+                &first_fen,
+                &[],
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let other_history = vec!["g1f3", "b8c6", "b1c3", "g8f6"];
+        let fen = Fen::from_position(
+            position_after(
+                &root.fen,
+                &other_history
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let node: i64 = s
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM deep_tree_nodes WHERE project_id=?1 AND history=?2",
+                params![p.id, serde_json::to_string(&other_history).unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let err = s
+            .queue_at_occurrence(&p.id, &root.id, &fen, 4, node)
+            .unwrap_err();
+        assert!(err.contains("parent PV"), "{err}");
+        assert_eq!(s.list_tasks(&p.id).unwrap().len(), 2);
+    }
+    #[test]
+    fn relinking_an_older_orphan_does_not_replace_a_newer_direct_score() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.sqlite");
+        let s = Store::open(&path).unwrap();
+        let p = s
+            .create_project(
+                "partial",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let root = s.claim(&p.id).unwrap().unwrap();
+        s.save(
+            &root.id,
+            &[parse_line("info depth 8 score cp 30 pv e2e4", &root.fen, &[]).unwrap()],
+        )
+        .unwrap();
+        let fen = Fen::from_position(
+            position_after(&root.fen, &["e2e4".into()]).unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let older = s.queue(&p.id, Some(&root.id), &fen, 1).unwrap();
+        s.claim(&p.id).unwrap();
+        s.save(
+            &older.id,
+            &[parse_line("info depth 8 score cp -10 pv e7e5", &fen, &[]).unwrap()],
+        )
+        .unwrap();
+        let newer = s.queue(&p.id, Some(&root.id), &fen, 1).unwrap();
+        s.claim(&p.id).unwrap();
+        s.save(
+            &newer.id,
+            &[parse_line("info depth 8 score cp -20 pv e7e6", &fen, &[]).unwrap()],
+        )
+        .unwrap();
+        s.conn()
+            .unwrap()
+            .execute(
+                "DELETE FROM deep_tree_analyses WHERE task_id=?1",
+                [&older.id],
+            )
+            .unwrap();
+        drop(s);
+        let reopened = Store::open(&path).unwrap();
+        let conn = reopened.conn().unwrap();
+        let node_id: i64 = conn
+            .query_row(
+                "SELECT node_id FROM deep_tree_analyses WHERE task_id=?1",
+                [&newer.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let (links, score): (i64,i32) = conn.query_row(
+            "SELECT (SELECT count(*) FROM deep_tree_analyses WHERE node_id=?1),direct_score_value
+             FROM deep_tree_nodes WHERE id=?1", [node_id], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!((links, score), (2, 20));
+        assert_eq!(reopened.results(&p.id).unwrap().len(), 3);
+    }
+    #[test]
+    fn opening_a_legacy_project_backfills_tree_without_changing_saved_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        let s = Store::open(&path).unwrap();
+        let p = s
+            .create_project(
+                "legacy",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        let task = s.list_tasks(&p.id).unwrap().remove(0);
+        let conn = s.conn().unwrap();
+        conn.execute(
+            "UPDATE deep_tasks SET status='completed' WHERE id=?1",
+            [&task.id],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO deep_results(task_id,multipv,depth,score_kind,score_value,score_perspective,uci_moves) VALUES(?1,1,8,'cp',42,'white','[\"e2e4\"]')", [&task.id]).unwrap();
+        conn.execute_batch("DROP TABLE deep_tree_nodes").unwrap();
+        drop(conn);
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.results(&p.id).unwrap()[0].lines[0].score_value, 42);
+        let count: i32 = s
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM deep_tree_nodes WHERE project_id=?1",
+                [&p.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+    #[test]
+    fn unambiguous_legacy_child_replaces_a_wrong_cached_occurrence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite");
+        let s = Store::open(&path).unwrap();
+        let p = s
+            .create_project(
+                "legacy",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                2,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let root = s.claim(&p.id).unwrap().unwrap();
+        s.save(
+            &root.id,
+            &[
+                parse_line("info depth 8 multipv 1 score cp 20 pv e2e4", &root.fen, &[]).unwrap(),
+                parse_line("info depth 8 multipv 2 score cp 10 pv d2d4", &root.fen, &[]).unwrap(),
+            ],
+        )
+        .unwrap();
+        let fen = Fen::from_position(
+            position_after(&root.fen, &["e2e4".into()]).unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let child_id = uuid::Uuid::new_v4().to_string();
+        let conn = s.conn().unwrap();
+        let intended: i64 = conn
+            .query_row(
+                "SELECT id FROM deep_tree_nodes WHERE project_id=?1 AND history='[\"e2e4\"]'",
+                [&p.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let wrong: i64 = conn
+            .query_row(
+                "SELECT id FROM deep_tree_nodes WHERE project_id=?1 AND history='[\"d2d4\"]'",
+                [&p.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute("INSERT INTO deep_tasks(id,project_id,parent_task_id,fen,moves,ply,status) VALUES(?1,?2,?3,?4,'[]',1,'completed')", params![child_id, p.id, root.id, fen]).unwrap();
+        conn.execute("INSERT INTO deep_results(task_id,multipv,depth,score_kind,score_value,score_perspective,uci_moves) VALUES(?1,1,8,'cp',77,'white','[\"e7e5\"]')", [&child_id]).unwrap();
+        conn.execute("UPDATE deep_tree_nodes SET analyzed_task_id=?1,direct_score_kind='cp',direct_score_value=77,minimax_score_kind='cp',minimax_score_value=77 WHERE id=?2", params![child_id, wrong]).unwrap();
+        drop(conn);
+        drop(s);
+        for _ in 0..2 {
+            let reopened = Store::open(&path).unwrap();
+            let conn = reopened.conn().unwrap();
+            let linked: i64 = conn
+                .query_row(
+                    "SELECT node_id FROM deep_tree_analyses WHERE task_id=?1",
+                    [&child_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(linked, intended);
+            let stale: (Option<String>, Option<i32>) = conn
+                .query_row(
+                    "SELECT analyzed_task_id,direct_score_value FROM deep_tree_nodes WHERE id=?1",
+                    [wrong],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(stale, (None, None));
+            let deferred: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM deep_tree_backfill_deferred WHERE task_id=?1",
+                    [&child_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(deferred, 0);
+            assert_eq!(reopened.results(&p.id).unwrap()[1].lines[0].score_value, 77);
+        }
+    }
+    #[test]
+    fn saving_a_pv_near_max_ply_returns_an_error_without_partial_tree_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let p = s
+            .create_project(
+                "overflow",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let root = s.claim(&p.id).unwrap().unwrap();
+        s.save(
+            &root.id,
+            &[parse_line("info depth 8 score cp 20 pv e2e4", &root.fen, &[]).unwrap()],
+        )
+        .unwrap();
+        let extreme = s.queue_root(&p.id, &start_fen(), u32::MAX).unwrap();
+        assert_eq!(s.claim(&p.id).unwrap().unwrap().id, extreme.id);
+        let line = parse_line("info depth 8 score cp 25 pv e2e4", &extreme.fen, &[]).unwrap();
+        let err = s.save(&extreme.id, &[line]).unwrap_err();
+        assert!(err.contains("ply"), "{err}");
+        assert_eq!(
+            s.list_tasks(&p.id).unwrap().last().unwrap().status,
+            "running"
+        );
+        assert_eq!(s.results(&p.id).unwrap().len(), 1);
+        let count: i64 = s
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM deep_tree_nodes WHERE analyzed_task_id=?1",
+                [&extreme.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

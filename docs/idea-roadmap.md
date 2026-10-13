@@ -4,9 +4,9 @@ Reference: ChessOK's [Aquarium manual](https://shop.chessok.com/manuals/manuals/
 
 ## Where the fork stands
 
-The `feature/deep-analysis` branch already adds a separate Deep Analysis page, persistent SQLite projects/tasks/results, a local UCI engine worker, MultiPV snapshots, progress polling, and start/pause/resume/cancel. It stores a root position and permits manually queued positions. Existing Rust tests exercise persistence, interruptions, legal PVs, and cancellation; the frontend has focused UI and service tests.
+The `feature/deep-analysis` branch adds a separate Deep Analysis page, persistent SQLite projects/tasks/results, a local UCI engine worker, MultiPV snapshots, progress polling, and start/pause/resume/cancel. It stores a root position and permits manually queued positions. The first M1 backend slice now persists completed PV move occurrences with full paths and separate direct/provisional minimax scores, and backfills completed legacy results. See `docs/idea-implementation-status.md` for verified progress and known gaps.
 
-This is a **position queue**, not IDeA yet: it does not automatically expand a position tree, back up minimaxed scores, choose continuations from the tree, render a board-linked analysis tree, or let the user steer moves in that tree. The backend has a continuation command, but the frontend service/page does not expose it. The existing worker runs one project/engine at a time. Keep this branch as the foundation; do not describe it as feature-complete or merge it merely because the basic queue works.
+This is **not usable IDeA yet**: it does not automatically expand the tree, choose continuations from it, expose it to the workbench, or let the user steer moves in it. The backend now rejects ambiguous same-ply transpositions unless an exact occurrence ID is supplied, but legacy ambiguous tasks are deferred until a user can resolve them; terminal scoring and a complete minimax rebuild still need work. The backend has a continuation command, but the frontend service/page does not expose it. The existing worker runs one project/engine at a time. Keep this branch as the foundation; do not describe it as feature-complete or merge it merely because the basic queue works.
 
 ## Target behavior, in order
 
@@ -31,4 +31,4 @@ For every milestone run frontend tests/typecheck and Rust tests/clippy/fmt on a 
 
 ## Planning baseline (12 October 2026)
 
-On this checkout, 20 focused Deep Analysis frontend tests pass when Node 26 is given `NODE_OPTIONS=--localstorage-file=<scratch path>`; TypeScript `tsc --noEmit` passes. Without that flag, one navigation suite fails during import because `localStorage` is unavailable in this Node environment. Cargo/Rust is not installed here, so the existing Rust tests and an actual Tauri engine/board smoke test are **not yet verified** on this machine. Do not infer backend runtime correctness from the frontend checks.
+On this checkout, 20 focused Deep Analysis frontend tests pass when Node 26 is given `NODE_OPTIONS=--localstorage-file=<scratch path>`; TypeScript `tsc --noEmit` passes. Without that flag, one navigation suite fails during import because `localStorage` is unavailable in this Node environment. Homebrew rustup and stable Cargo 1.99.0 were already installed but not on PATH; after exposing the keg-only rustup bin, `cargo test --manifest-path src-tauri/Cargo.toml --no-default-features` passed (91 tests, 9 ignored). An actual Tauri engine/board smoke test is **not yet verified** on this machine.

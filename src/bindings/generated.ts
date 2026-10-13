@@ -638,9 +638,9 @@ async queueDeepAnalysisRoot(projectId: string, fen: string, ply: number) : Promi
     else return { status: "error", error: e  as any };
 }
 },
-async queueDeepAnalysisContinuation(projectId: string, parentTaskId: string, fen: string, ply: number) : Promise<Result<DeepAnalysisTask, string>> {
+async queueDeepAnalysisContinuation(projectId: string, parentTaskId: string, fen: string, ply: number, occurrenceId: bigint | null) : Promise<Result<DeepAnalysisTask, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("queue_deep_analysis_continuation", { projectId, parentTaskId, fen, ply }) };
+    return { status: "ok", data: await TAURI_INVOKE("queue_deep_analysis_continuation", { projectId, parentTaskId, fen, ply, occurrenceId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
