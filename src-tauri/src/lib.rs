@@ -7,6 +7,7 @@ mod app;
 mod chess;
 mod db;
 mod deep_analysis;
+pub use deep_analysis::{resume_debug_analysis, run_debug_analysis, show_debug_analysis};
 mod error;
 mod fide;
 mod fs;

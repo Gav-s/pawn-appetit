@@ -1,5 +1,100 @@
 //! Self-contained scheduler policy; no engine or database dependencies.
+use rand::Rng;
 use serde::{Deserialize, Serialize};
+
+/// An unanalysed move occurrence; `index` is the backed-up score of its nearest scored parent.
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub occurrence_id: i64,
+    pub index: u8,
+    pub ply: u32,
+    pub preferred: bool,
+    pub siblings: u32,
+}
+impl Candidate {
+    pub fn new(occurrence_id: i64, index: u8, ply: u32, preferred: bool, siblings: u32) -> Self {
+        Self {
+            occurrence_id,
+            index,
+            ply,
+            preferred,
+            siblings,
+        }
+    }
+}
+
+/// Bounded, independently testable candidate ranking. No legal moves are invented here.
+pub fn select_candidates<R: Rng + ?Sized>(
+    stage: Stage,
+    root_index: u8,
+    available: &[Candidate],
+    settings: &AnalysisSettings,
+    rng: &mut R,
+) -> Vec<i64> {
+    let limit = settings.max_positions as usize;
+    if limit == 0 {
+        return vec![];
+    }
+    let in_range = |c: &&Candidate, delta: u8| {
+        c.index <= 99
+            && c.index.abs_diff(root_index) <= delta
+            && c.index >= root_index.saturating_sub(delta)
+            && c.index <= root_index.saturating_add(delta).min(99)
+    };
+    let base = if stage == Stage::Base {
+        let mut chosen = Vec::new();
+        for extra in (0..=52u8).step_by(3).chain(std::iter::once(52)) {
+            let delta = settings.max_delta.saturating_add(extra);
+            chosen = available.iter().filter(|c| in_range(c, delta)).collect();
+            if !chosen.is_empty() {
+                break;
+            }
+        }
+        chosen
+    } else {
+        available
+            .iter()
+            .filter(|c| in_range(c, settings.max_delta))
+            .collect()
+    };
+    let mut choices: Vec<&Candidate> = base
+        .into_iter()
+        .filter(|c| match stage {
+            Stage::Alternatives => !c.preferred && c.siblings > 1,
+            Stage::Prolong => c.preferred && c.ply > 0,
+            _ => true,
+        })
+        .collect();
+    if stage == Stage::Random {
+        let mut output = Vec::new();
+        while !choices.is_empty() && output.len() < limit {
+            let weights: Vec<u32> = choices
+                .iter()
+                .map(|c| u32::from(6u8.saturating_sub(c.index.abs_diff(root_index))).max(1))
+                .collect();
+            let mut pick = rng.gen_range(0..weights.iter().sum::<u32>());
+            let selected = weights
+                .iter()
+                .position(|&weight| {
+                    if pick < weight {
+                        true
+                    } else {
+                        pick -= weight;
+                        false
+                    }
+                })
+                .unwrap();
+            output.push(choices.remove(selected).occurrence_id);
+        }
+        return output;
+    }
+    choices.sort_by_key(|c| (c.index.abs_diff(root_index), c.ply, c.occurrence_id));
+    choices
+        .into_iter()
+        .take(limit)
+        .map(|c| c.occurrence_id)
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,6 +158,8 @@ pub enum Stage {
 #[serde(default)]
 pub struct AnalysisSettings {
     pub max_positions: u32,
+    /// Maximum plies of automatic expansion from the project's root.
+    pub max_ply: u32,
     pub max_delta: u8,
     pub analysis_time_ms: u32,
     pub analysis_depth: u32,
@@ -76,6 +173,7 @@ impl Default for AnalysisSettings {
     fn default() -> Self {
         Self {
             max_positions: 4,
+            max_ply: 3,
             max_delta: 10,
             analysis_time_ms: 1000,
             analysis_depth: 12,
@@ -100,7 +198,83 @@ impl AnalysisSettings {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnalysisOperation, AnalysisSettings, Completion, Stage};
+    use super::{
+        select_candidates, AnalysisOperation, AnalysisSettings, Candidate, Completion, Stage,
+    };
+    use rand::SeedableRng;
+
+    #[test]
+    fn base_widens_three_at_a_time_but_stops_at_fifty_two_and_trims() {
+        let settings = AnalysisSettings {
+            max_delta: 0,
+            max_positions: 1,
+            ..Default::default()
+        };
+        let candidates = vec![
+            Candidate::new(1, 54, 1, true, 1),
+            Candidate::new(2, 99, 1, true, 1),
+        ];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(2);
+        assert_eq!(
+            select_candidates(Stage::Base, 50, &candidates, &settings, &mut rng),
+            vec![1]
+        );
+        let far = vec![Candidate::new(2, 99, 1, true, 1)];
+        assert_eq!(
+            select_candidates(Stage::Base, 50, &far, &settings, &mut rng),
+            vec![2]
+        );
+        let beyond = vec![Candidate::new(3, 100, 1, true, 1)];
+        assert!(select_candidates(Stage::Base, 50, &beyond, &settings, &mut rng).is_empty());
+    }
+
+    #[test]
+    fn alternative_requires_meaningful_sibling_and_filters_before_random() {
+        let settings = AnalysisSettings {
+            max_delta: 4,
+            max_positions: 1,
+            ..Default::default()
+        };
+        let candidates = vec![
+            Candidate::new(1, 49, 1, true, 2),
+            Candidate::new(2, 52, 1, false, 2),
+            Candidate::new(3, 80, 1, false, 2),
+            Candidate::new(4, 50, 1, false, 1),
+        ];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        assert_eq!(
+            select_candidates(Stage::Alternatives, 50, &candidates, &settings, &mut rng),
+            vec![2]
+        );
+        for _ in 0..32 {
+            assert_ne!(
+                select_candidates(Stage::Random, 50, &candidates, &settings, &mut rng),
+                vec![3]
+            );
+        }
+    }
+
+    #[test]
+    fn random_is_seed_reproducible_and_weighted() {
+        let settings = AnalysisSettings {
+            max_delta: 5,
+            max_positions: 1,
+            ..Default::default()
+        };
+        let candidates = vec![
+            Candidate::new(1, 50, 1, true, 1),
+            Candidate::new(2, 54, 1, true, 1),
+        ];
+        let draw = |seed| {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            (0..256)
+                .map(|_| select_candidates(Stage::Random, 50, &candidates, &settings, &mut rng)[0])
+                .collect::<Vec<_>>()
+        };
+        let a = draw(123);
+        assert_eq!(a, draw(123));
+        assert!(a.iter().filter(|&&id| id == 1).count() > a.iter().filter(|&&id| id == 2).count());
+    }
 
     #[test]
     fn rotation_and_prolong_frequency_are_explicit() {

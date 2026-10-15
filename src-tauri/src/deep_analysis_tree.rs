@@ -314,18 +314,25 @@ pub(super) fn store_completed(
         .map_err(|e| e.to_string())?;
         id
     } else {
-        tx.execute(
-            "INSERT INTO deep_tree_nodes(project_id,source_task_id,analyzed_task_id,fen,history,ply)
-             VALUES(?1,?2,?2,?3,?4,?5) ON CONFLICT(analyzed_task_id) DO NOTHING",
-            params![project_id, task_id, root_fen, moves_json, ply],
-        )
-        .map_err(|e| e.to_string())?;
-        tx.query_row(
-            "SELECT id FROM deep_tree_nodes WHERE analyzed_task_id=?1",
-            [task_id],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?
+        let existing: Option<i64> = tx.query_row(
+            "SELECT id FROM deep_tree_nodes WHERE project_id=?1 AND source_task_id=?2 AND parent_id IS NULL AND fen=?3 AND history=?4 AND ply=?5 ORDER BY id LIMIT 1",
+            params![project_id,task_id,root_fen,moves_json,ply],|row|row.get(0)).optional().map_err(|e|e.to_string())?;
+        if let Some(id) = existing {
+            tx.execute("UPDATE deep_tree_nodes SET analyzed_task_id=?2 WHERE id=?1 AND analyzed_task_id IS NULL",params![id,task_id]).map_err(|e|e.to_string())?;
+            id
+        } else {
+            tx.execute(
+                "INSERT INTO deep_tree_nodes(project_id,source_task_id,analyzed_task_id,fen,history,ply)
+                 VALUES(?1,?2,?2,?3,?4,?5) ON CONFLICT(analyzed_task_id) DO NOTHING",
+                params![project_id, task_id, root_fen, moves_json, ply],
+            ).map_err(|e| e.to_string())?;
+            tx.query_row(
+                "SELECT id FROM deep_tree_nodes WHERE analyzed_task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?
+        }
     };
     if tx.execute(
         "UPDATE deep_tasks SET occurrence_id=?2 WHERE id=?1 AND (occurrence_id IS NULL OR occurrence_id=?2)",
