@@ -18,6 +18,8 @@ use tauri::{path::BaseDirectory, Manager};
 use tauri_specta::Event;
 use vampirc_uci::{parse_one, uci::ScoreValue, UciInfoAttribute, UciMessage};
 
+#[path = "deep_analysis_read.rs"]
+mod read;
 #[path = "deep_analysis_scheduler.rs"]
 mod scheduler;
 #[path = "deep_analysis_score.rs"]
@@ -244,6 +246,7 @@ impl Store {
             }
         }
         tree::backfill_legacy(&mut conn)?;
+        read::restore_missing_roots(&mut conn)?;
         Ok(store)
     }
     fn conn(&self) -> Result<Connection, String> {
