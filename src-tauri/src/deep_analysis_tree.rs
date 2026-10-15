@@ -1,6 +1,6 @@
 //! Persistent move occurrences for IDeA. Every node keeps its actual path; a repeated
 //! board is not merged with another history (threefold repetition depends on the path).
-use super::{position_after, DeepAnalysisLine};
+use super::{position_after, score::AnalysisScore, DeepAnalysisLine};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use shakmaty::{fen::Fen, uci::UciMove, EnPassantMode, Position};
 
@@ -414,14 +414,6 @@ pub(super) fn store_completed(
     Ok(())
 }
 
-fn score_rank(kind: &str, value: i32) -> i64 {
-    match kind {
-        "mate" if value > 0 => 1_000_000 - i64::from(value),
-        "mate" if value < 0 => -1_000_000 - i64::from(value),
-        _ => i64::from(value).clamp(-500_000, 500_000),
-    }
-}
-
 // Only scored children participate. The result is provisional while the tree is incomplete.
 fn recompute_ancestors(tx: &Transaction<'_>, start: i64) -> Result<(), String> {
     let mut next = Some(start);
@@ -445,17 +437,24 @@ fn recompute_ancestors(tx: &Transaction<'_>, start: i64) -> Result<(), String> {
             .map_err(|e| e.to_string())?
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())?;
+        let rank = |(kind, value): &(String, i32)| -> Result<i64, String> {
+            Ok(AnalysisScore::from_stored(Some(kind), Some(*value))?.rank())
+        };
+        let mut chosen: Option<(String, i32)> = None;
         let turn = super::position(&fen)?.turn();
-        let score = if turn == shakmaty::Color::White {
-            child_scores
-                .into_iter()
-                .max_by_key(|(kind, value)| score_rank(kind, *value))
-        } else {
-            child_scores
-                .into_iter()
-                .min_by_key(|(kind, value)| score_rank(kind, *value))
+        for candidate in child_scores {
+            let better = match &chosen {
+                None => true,
+                Some(previous) if turn == shakmaty::Color::White => {
+                    rank(&candidate)? > rank(previous)?
+                }
+                Some(previous) => rank(&candidate)? < rank(previous)?,
+            };
+            if better {
+                chosen = Some(candidate);
+            }
         }
-        .or_else(|| direct_kind.zip(direct_value));
+        let score = chosen.or_else(|| direct_kind.zip(direct_value));
         tx.execute(
             "UPDATE deep_tree_nodes SET minimax_score_kind=?2,minimax_score_value=?3 WHERE id=?1",
             params![

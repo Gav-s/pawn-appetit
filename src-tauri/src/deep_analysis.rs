@@ -17,6 +17,8 @@ use tauri::{path::BaseDirectory, Manager};
 use tauri_specta::Event;
 use vampirc_uci::{parse_one, uci::ScoreValue, UciInfoAttribute, UciMessage};
 
+#[path = "deep_analysis_score.rs"]
+mod score;
 #[path = "deep_analysis_tree.rs"]
 mod tree;
 
