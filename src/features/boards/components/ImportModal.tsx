@@ -10,11 +10,7 @@ import { FileTypeSelector } from "@/features/files/components/FileTypeSelector";
 import { PgnSourceInput, type PgnTarget } from "@/features/files/components/PgnSourceInput";
 import type { FileType } from "@/features/files/utils/file";
 import { activeTabAtom, currentTabAtom, tabsAtom } from "@/state/atoms";
-import {
-  importGameContent,
-  type ImportResult,
-  type ImportSource,
-} from "../import/importService";
+import { importGameContent, type ImportResult, type ImportSource } from "../import/importService";
 import { ImportSummary } from "./ImportSummary";
 
 export default function ImportModal({

@@ -3,7 +3,13 @@ import type { Piece } from "@lichess-org/chessground/types";
 import { Box, Group, Text } from "@mantine/core";
 import { useHotkeys } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { IconCamera, IconCopy, IconEraser, IconSwitchVertical, IconTool } from "@tabler/icons-react";
+import {
+  IconCamera,
+  IconCopy,
+  IconEraser,
+  IconSwitchVertical,
+  IconTool,
+} from "@tabler/icons-react";
 import { save } from "@tauri-apps/plugin-dialog";
 import { writeFile } from "@tauri-apps/plugin-fs";
 import { makeSquare, type NormalMove, parseSquare, parseUci, type SquareName } from "chessops";

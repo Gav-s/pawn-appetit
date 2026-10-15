@@ -158,7 +158,10 @@ function TopBar({
   }, [searchProviders, spotlightQuery]);
 
   const spotlightActions = useMemo(
-    () => [...commandsToSpotlightActions(commands), ...searchResultsToSpotlightActions(searchResults)],
+    () => [
+      ...commandsToSpotlightActions(commands),
+      ...searchResultsToSpotlightActions(searchResults),
+    ],
     [commands, searchResults],
   );
 

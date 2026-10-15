@@ -339,7 +339,10 @@ function GraphPanel() {
         return `M ${source.y},${source.x} Q ${midX},${midY - curvature} ${target.y},${target.x}`;
       });
 
-    const linkGenerator = linkHorizontal<HierarchyPointLink<TreeNode>, HierarchyPointNode<TreeNode>>()
+    const linkGenerator = linkHorizontal<
+      HierarchyPointLink<TreeNode>,
+      HierarchyPointNode<TreeNode>
+    >()
       .x((d) => d.y)
       .y((d) => d.x);
 

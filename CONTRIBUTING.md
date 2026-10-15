@@ -39,8 +39,8 @@ The following steps will get you setup to contribute changes to this repo:
 
 Create a `.env` file in the project root to configure the following variables before running the app:
 
-| Variable | Required | Description |
-|---|---|---|
+| Variable          | Required                     | Description                                                                                                                                                                          |
+| ----------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `VITE_SERVER_URL` | Yes (for database downloads) | Base URL of the file server used to download game and puzzle databases. Without this, the "Web" tab in the Add Database dialog will show an error and downloads will be unavailable. |
 
 Example `.env`:

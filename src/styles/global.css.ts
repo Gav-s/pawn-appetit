@@ -41,13 +41,19 @@ globalStyle("[data-density='compact'] .mantine-Card-root", {
     padding: "0.625rem",
 });
 
-globalStyle("[data-density='compact'] .mantine-Table-tr, [data-density='compact'] .mantine-DataTable-row", {
-    minHeight: "2rem",
-});
+globalStyle(
+    "[data-density='compact'] .mantine-Table-tr, [data-density='compact'] .mantine-DataTable-row",
+    {
+        minHeight: "2rem",
+    },
+);
 
-globalStyle("[data-density='compact'] .mantine-DataTable-table th, [data-density='compact'] .mantine-DataTable-table td", {
-    paddingBlock: "0.35rem",
-});
+globalStyle(
+    "[data-density='compact'] .mantine-DataTable-table th, [data-density='compact'] .mantine-DataTable-table td",
+    {
+        paddingBlock: "0.35rem",
+    },
+);
 
 globalStyle("*", {
     "@media": {
