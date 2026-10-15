@@ -699,6 +699,30 @@ impl Store {
         }
         Ok(out)
     }
+    fn stop(&self, id: &str, clear_pending: bool) -> Result<(), String> {
+        let mut c = self.conn()?;
+        let tx = c.transaction().map_err(|e| e.to_string())?;
+        if tx
+            .execute(
+                "UPDATE deep_projects SET status='stopped' WHERE id=?1 AND status!='cancelled'",
+                [id],
+            )
+            .map_err(|e| e.to_string())?
+            == 0
+        {
+            return Err("project not found or cancelled".into());
+        }
+        if clear_pending {
+            tx.execute("UPDATE deep_tasks SET status='cancelled' WHERE project_id=?1 AND status IN ('queued','running')",[id]).map_err(|e|e.to_string())?;
+        } else {
+            tx.execute(
+                "UPDATE deep_tasks SET status='queued' WHERE project_id=?1 AND status='running'",
+                [id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
     fn cancel(&self, id: &str) -> Result<(), String> {
         let mut c = self.conn()?;
         let tx = c.transaction().map_err(|e| e.to_string())?;
@@ -1055,6 +1079,16 @@ impl DeepAnalysisState {
         }
         Ok(())
     }
+    fn stop(&self, store: &Store, project_id: &str, clear_pending: bool) -> Result<bool, String> {
+        let active = self.active.lock().map_err(|e| e.to_string())?;
+        store.stop(project_id, clear_pending)?;
+        if let Some(worker) = active.as_ref().filter(|w| w.project_id == project_id) {
+            worker.cancelled.store(true, Ordering::Release);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
     fn cancel(&self, store: &Store, project_id: &str) -> Result<(), String> {
         let active = self.active.lock().map_err(|e| e.to_string())?;
         store.cancel(project_id)?;
@@ -1176,6 +1210,22 @@ pub fn queue_deep_analysis_continuation(
 pub fn pause_deep_analysis(app: tauri::AppHandle, project_id: String) -> Result<(), String> {
     let s = store(&app)?;
     app.state::<DeepAnalysisState>().pause(&s, &project_id)?;
+    let _ = DeepAnalysisProgress::emit(&s.progress(&project_id, None, None)?, &app);
+    Ok(())
+}
+#[tauri::command]
+#[specta::specta]
+pub async fn stop_deep_analysis(
+    app: tauri::AppHandle,
+    project_id: String,
+    clear_pending: bool,
+    state: tauri::State<'_, DeepAnalysisState>,
+) -> Result<(), String> {
+    let s = store(&app)?;
+    let active = state.stop(&s, &project_id, clear_pending)?;
+    if active {
+        drop(state.acquire_after_drain(&project_id).await?);
+    }
     let _ = DeepAnalysisProgress::emit(&s.progress(&project_id, None, None)?, &app);
     Ok(())
 }
@@ -1558,6 +1608,17 @@ async fn drive_debug_analysis(db: &Path, id: &str, max_results: u32) -> Result<S
     }
     drop(s);
     show_debug_analysis(db, &project.id)
+}
+
+/// Explicitly stop generation, preserve results and choose the queued-task policy.
+pub fn stop_debug_analysis(
+    db: &Path,
+    project_id: &str,
+    clear_pending: bool,
+) -> Result<String, String> {
+    let s = Store::open(db)?;
+    s.stop(project_id, clear_pending)?;
+    show_debug_analysis(db, project_id)
 }
 
 pub fn show_debug_analysis(db: &Path, id: &str) -> Result<String, String> {
@@ -2307,6 +2368,46 @@ mod tests {
         assert_eq!(s.progress(&p.id, None, None).unwrap().completed, 0);
         assert_eq!(s.results(&p.id).unwrap()[0].lines[0].score_value, 34);
     }
+    #[test]
+    fn stop_retains_or_clears_pending_without_losing_accepted_tree() {
+        for clear_pending in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let s = Store::open(&dir.path().join("db")).unwrap();
+            let p = s
+                .create_project(
+                    "stop",
+                    std::env::current_exe().unwrap().to_str().unwrap(),
+                    100,
+                    1,
+                    &start_fen(),
+                    &[],
+                )
+                .unwrap();
+            s.begin_running(&p.id, "paused").unwrap();
+            let root = s.claim(&p.id).unwrap().unwrap();
+            s.save(
+                &root.id,
+                &[parse_line("info depth 8 score cp 0 pv e2e4", &root.fen, &[]).unwrap()],
+            )
+            .unwrap();
+            let pending = s.queue_root(&p.id, "startpos", 0).unwrap();
+            s.stop(&p.id, clear_pending).unwrap();
+            assert_eq!(s.status(&p.id).unwrap(), "stopped");
+            assert_eq!(s.results(&p.id).unwrap().len(), 1);
+            let task = s
+                .list_tasks(&p.id)
+                .unwrap()
+                .into_iter()
+                .find(|t| t.id == pending.id)
+                .unwrap();
+            assert_eq!(
+                task.status,
+                if clear_pending { "cancelled" } else { "queued" }
+            );
+            assert!(s.claim(&p.id).unwrap().is_none());
+        }
+    }
+
     #[test]
     fn cache_is_separate_from_tree_and_requires_measured_time_depth_and_context() {
         let dir = tempfile::tempdir().unwrap();

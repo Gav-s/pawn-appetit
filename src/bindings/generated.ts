@@ -670,6 +670,14 @@ async resumeDeepAnalysis(projectId: string) : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async stopDeepAnalysis(projectId: string, clearPending: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("stop_deep_analysis", { projectId, clearPending }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async cancelDeepAnalysis(projectId: string) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("cancel_deep_analysis", { projectId }) };

@@ -10,6 +10,11 @@ async fn main() {
                 Ok(count) => pawn_appetit_lib::resume_debug_analysis(Path::new(db), project, count).await,
                 _ => Err("count must be a positive integer".into()),
             },
+        [_, command, db, project, flag] if command == "stop" => match flag.as_str() {
+            "keep" => pawn_appetit_lib::stop_debug_analysis(Path::new(db),project,false),
+            "clear" => pawn_appetit_lib::stop_debug_analysis(Path::new(db),project,true),
+            _ => Err("stop policy must be keep or clear".into()),
+        },
         [_, command, db, project] if command == "show" =>
             pawn_appetit_lib::show_debug_analysis(Path::new(db), project),
         [_, command, db, engine, fen, count, time_ms] if command == "run" => {
@@ -19,7 +24,7 @@ async fn main() {
                 _ => Err("count and time_ms must be positive integers".into()),
             }
         }
-        _ => Err("usage: analysis_debug run DB ENGINE 'FEN' COUNT TIME_MS | resume DB PROJECT_ID COUNT | show DB PROJECT_ID".into()),
+        _ => Err("usage: analysis_debug run DB ENGINE 'FEN' COUNT TIME_MS | resume DB PROJECT_ID COUNT | stop DB PROJECT_ID keep|clear | show DB PROJECT_ID".into()),
     };
     match result {
         Ok(output) => print!("{output}"),

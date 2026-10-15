@@ -1,5 +1,6 @@
 [package]
 name = "pawn-appetit"
+default-run = "pawn-appetit"
 version = "0.12.1"
 description = "A Modern Chess Database"
 authors = ["Pawn-Appetit Team"]

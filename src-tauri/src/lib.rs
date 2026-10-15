@@ -7,7 +7,9 @@ mod app;
 mod chess;
 mod db;
 mod deep_analysis;
-pub use deep_analysis::{resume_debug_analysis, run_debug_analysis, show_debug_analysis};
+pub use deep_analysis::{
+    resume_debug_analysis, run_debug_analysis, show_debug_analysis, stop_debug_analysis,
+};
 mod error;
 mod fide;
 mod fs;
@@ -29,7 +31,7 @@ use deep_analysis::{
     cancel_deep_analysis, create_deep_analysis_project, list_deep_analysis_projects,
     list_deep_analysis_results, list_deep_analysis_tasks, pause_deep_analysis,
     queue_deep_analysis_continuation, queue_deep_analysis_root, resume_deep_analysis,
-    start_deep_analysis,
+    start_deep_analysis, stop_deep_analysis,
 };
 use deep_analysis::{DeepAnalysisProgress, DeepAnalysisState};
 use derivative::Derivative;
@@ -190,6 +192,7 @@ pub async fn run() {
             start_deep_analysis,
             pause_deep_analysis,
             resume_deep_analysis,
+            stop_deep_analysis,
             cancel_deep_analysis
         ))
         .events(tauri_specta::collect_events!(
