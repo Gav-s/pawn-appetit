@@ -3,7 +3,14 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import DeepAnalysisPage from "../DeepAnalysisPage";
-import type { DeepAnalysisService } from "../service";
+import type {
+  AnalysisNodeView,
+  AnalysisProjectSummary,
+  SchedulerView,
+  DeepAnalysisProgress,
+  AnalysisUpdate,
+  DeepAnalysisService,
+} from "../service";
 
 const FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 const project = {
@@ -34,6 +41,47 @@ const line = {
   uciMoves: ["e2e4", "e7e5"],
 };
 
+const summary: AnalysisProjectSummary = {
+  id: "p1",
+  name: "Opening study",
+  rootFen: FEN,
+  schedulerState: "paused",
+  currentStage: "base",
+  engine: "/usr/bin/stockfish",
+  createdAt: "2026-01-01",
+  updatedAt: null,
+  taskCounts: { queued: 1, running: 0, completed: 0, failed: 0, cancelled: 0 },
+  analysedNodeCount: 0,
+};
+const rootNode: AnalysisNodeView = {
+  id: "1",
+  parentId: null,
+  moveUci: null,
+  moveSan: null,
+  fen: FEN,
+  sideToMove: "white",
+  rawEvaluation: { kind: "unknown" },
+  treeIndex: null,
+  depth: null,
+  elapsedMs: null,
+  pv: [],
+  engine: "/usr/bin/stockfish",
+  minimaxEvaluation: { kind: "unknown" },
+  status: "queued",
+  transpositionLinked: false,
+};
+const scheduler: SchedulerView = {
+  state: "paused",
+  cycle: "0",
+  stage: "base",
+  queueLength: 1,
+  activeTaskId: null,
+  completedCount: 0,
+  emptyStageCount: 0,
+  exhausted: false,
+  engineState: "idle",
+};
+
 Object.assign(globalThis, {
   IS_REACT_ACT_ENVIRONMENT: true,
   ResizeObserver: class {
@@ -56,10 +104,14 @@ Object.defineProperty(window, "matchMedia", {
     dispatchEvent: vi.fn(),
   })),
 });
-let root: Root;
+let root: Root | undefined;
 let host: HTMLDivElement;
 afterEach(async () => {
-  if (root) await act(async () => root.unmount());
+  if (root) {
+    const mountedRoot = root;
+    await act(async () => mountedRoot.unmount());
+    root = undefined;
+  }
   host?.remove();
 });
 
@@ -69,9 +121,10 @@ async function render(
 ) {
   host = document.createElement("div");
   document.body.append(host);
-  root = createRoot(host);
+  const mountedRoot = createRoot(host);
+  root = mountedRoot;
   await act(async () =>
-    root.render(
+    mountedRoot.render(
       <MantineProvider>
         <DeepAnalysisPage service={service} installedEngines={engines} />
       </MantineProvider>,
@@ -100,7 +153,50 @@ function fixture(persisted = false) {
   let results: { taskId: string; lines: (typeof line)[] }[] = persisted
     ? [{ taskId: task.id, lines: [line] }]
     : [];
-  const service: DeepAnalysisService = {
+  const listeners = new Set<(update: AnalysisUpdate) => void>();
+  let latestListener: ((update: AnalysisUpdate) => void) | undefined;
+  const service: DeepAnalysisService & {
+    emitUpdate(update: AnalysisUpdate): void;
+    updateListenerCount(): number;
+    latestUpdateListener(): ((update: AnalysisUpdate) => void) | undefined;
+  } = {
+    emitUpdate: (update) => {
+      for (const listener of listeners) listener(update);
+    },
+    updateListenerCount: () => listeners.size,
+    latestUpdateListener: () => latestListener,
+    onUpdate: vi.fn(async (callback) => {
+      latestListener = callback;
+      listeners.add(callback);
+      return () => {
+        listeners.delete(callback);
+      };
+    }),
+    listSummaries: vi.fn(async () =>
+      projects.map((item) => ({
+        ...summary,
+        id: item.id,
+        name: item.title,
+        schedulerState: item.status,
+      })),
+    ),
+    getSummary: vi.fn(async (id) => ({
+      ...summary,
+      id,
+      schedulerState: projects.find((item) => item.id === id)?.status ?? "paused",
+    })),
+    getTree: vi.fn(async () => [rootNode]),
+    getNode: vi.fn(async () => rootNode),
+    getTaskViews: vi.fn(async () => []),
+    getScheduler: vi.fn(async () => scheduler),
+    startAutomatic: vi.fn(async () => {
+      projects = [{ ...project, status: "running" }];
+      tasks = [{ ...task, status: "running" }];
+      results = [{ taskId: "t1", lines: [line] }];
+    }),
+    stop: vi.fn(async () => {}),
+    manualProlong: vi.fn(async () => task),
+    onProgress: vi.fn(async () => () => {}),
     listProjects: vi.fn(async () => projects),
     listTasks: vi.fn(async () => tasks),
     listResults: vi.fn(async () => results),
@@ -135,6 +231,117 @@ function fixture(persisted = false) {
 }
 
 describe("Deep Analysis desktop workflow", () => {
+  it("subscribes once, refreshes read models on an update, and unsubscribes on unmount", async () => {
+    const service = fixture(true);
+    await render(service);
+    expect(service.updateListenerCount()).toBe(1);
+    expect(service.onUpdate).toHaveBeenCalledTimes(1);
+    const nextNode: AnalysisNodeView = {
+      ...rootNode,
+      id: "2",
+      parentId: "1",
+      moveUci: "e2e4",
+      moveSan: "e4",
+      status: "unanalysed",
+    };
+    vi.mocked(service.getTree).mockResolvedValue([rootNode, nextNode]);
+    await act(async () =>
+      service.emitUpdate({ projectId: "p1", kind: "tree_node_updated", taskId: "t1" }),
+    );
+    expect(host.textContent).toContain("e4");
+    const view = root!;
+    await act(async () =>
+      view.render(
+        <MantineProvider>
+          <DeepAnalysisPage
+            service={service}
+            installedEngines={[{ name: "Stockfish", path: "/usr/bin/stockfish" }]}
+          />
+        </MantineProvider>,
+      ),
+    );
+    expect(service.updateListenerCount()).toBe(1);
+    expect(service.onUpdate).toHaveBeenCalledTimes(1);
+    const late = service.latestUpdateListener()!;
+    await act(async () => view.unmount());
+    root = undefined;
+    expect(service.updateListenerCount()).toBe(0);
+    const reads = vi.mocked(service.getTree).mock.calls.length;
+    await act(async () => {
+      service.emitUpdate({ projectId: "p1", kind: "tree_node_updated", taskId: "t1" });
+      late({ projectId: "p1", kind: "tree_node_updated", taskId: "t1" });
+    });
+    expect(service.getTree).toHaveBeenCalledTimes(reads);
+  });
+
+  it("refreshes scheduler stage and project controls from semantic updates", async () => {
+    const service = fixture(true);
+    await render(service);
+    vi.mocked(service.listProjects).mockResolvedValue([{ ...project, status: "running" }]);
+    vi.mocked(service.getScheduler).mockResolvedValue({
+      ...scheduler,
+      state: "running",
+      stage: "alternatives",
+      queueLength: 2,
+    });
+    await act(async () =>
+      service.emitUpdate({ projectId: "p1", kind: "scheduler_stage_changed", taskId: null }),
+    );
+    expect(host.textContent).toContain("Stage alternatives");
+    expect(host.textContent).toContain("Queued 2");
+    expect(host.textContent).toContain("Pause analysis");
+  });
+
+  it("shows a selectable analysis tree and typed evaluation and queues manual prolong on a child", async () => {
+    const service = fixture(true);
+    const child: AnalysisNodeView = {
+      ...rootNode,
+      id: "2",
+      parentId: "1",
+      moveUci: "e2e4",
+      moveSan: "e4",
+      fen: "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1",
+      sideToMove: "black",
+      rawEvaluation: { kind: "centipawns", value: 37, display: "+0.37" },
+      minimaxEvaluation: { kind: "centipawns", value: 37, display: "+0.37" },
+      treeIndex: 55,
+      depth: 18,
+      pv: ["e7e5"],
+      status: "unanalysed",
+    };
+    vi.mocked(service.getTree).mockResolvedValue([rootNode, child]);
+    await render(service);
+    expect(host.textContent).toContain("Analysis tree");
+    expect(host.textContent).toContain("Scheduler");
+    await click("e4");
+    expect(host.textContent).toContain("Tree index 55");
+    expect(host.textContent).toContain(child.fen);
+    await click("Prolong selected node");
+    expect(service.manualProlong).toHaveBeenCalledWith("p1", "2", 1);
+  });
+
+  it("starts automatic analysis from the persisted project and stops while retaining work", async () => {
+    const service = fixture(true);
+    await render(service);
+    await click("Start analysis");
+    expect(service.startAutomatic).toHaveBeenCalledWith("p1");
+    await click("Stop analysis");
+    expect(service.stop).toHaveBeenCalledWith("p1", false);
+  });
+
+  it("refreshes the tree when progress is emitted instead of waiting for a fast poll", async () => {
+    const service = fixture(true);
+    let callback!: (progress: DeepAnalysisProgress) => void;
+    vi.mocked(service.onProgress).mockImplementation(async (fn) => {
+      callback = fn;
+      return () => {};
+    });
+    await render(service);
+    const before = vi.mocked(service.getTree).mock.calls.length;
+    await act(async () => callback({ projectId: "p1" } as never));
+    expect(vi.mocked(service.getTree).mock.calls.length).toBeGreaterThan(before);
+  });
+
   it("restores persisted projects, task statuses and principal variations on reopen", async () => {
     const service = fixture(true);
     await render(service);
@@ -154,7 +361,7 @@ describe("Deep Analysis desktop workflow", () => {
       vi.mocked(service.listResults).mockResolvedValue([
         { taskId: task.id, lines: [{ ...line, depth: 24, uciMoves: ["d2d4", "d7d5"] }] },
       ]);
-      await act(async () => vi.advanceTimersByTimeAsync(1500));
+      await act(async () => vi.advanceTimersByTimeAsync(15000));
       expect(host.textContent).toContain("Depth 24");
       expect(host.textContent).toContain("d2d4 d7d5");
       expect(host.textContent).not.toContain("e2e4 e7e5");
@@ -186,7 +393,7 @@ describe("Deep Analysis desktop workflow", () => {
         id === "p2" ? [] : [{ taskId: task.id, lines: [line] }],
       );
       await render(service);
-      await act(async () => vi.advanceTimersByTimeAsync(1500));
+      await act(async () => vi.advanceTimersByTimeAsync(15000));
       const selection = host.querySelector<HTMLInputElement>('[aria-label="Project"]')!;
       await act(async () => selection.click());
       const option = [...document.querySelectorAll('[role="option"]')].find((node) =>
@@ -246,7 +453,7 @@ describe("Deep Analysis desktop workflow", () => {
             });
       });
       await render(service);
-      await act(async () => vi.advanceTimersByTimeAsync(1500));
+      await act(async () => vi.advanceTimersByTimeAsync(15000));
       const selection = host.querySelector<HTMLInputElement>('[aria-label="Project"]')!;
       await act(async () => selection.click());
       const option = [...document.querySelectorAll('[role="option"]')].find((node) =>
@@ -264,7 +471,7 @@ describe("Deep Analysis desktop workflow", () => {
   it("does not dispatch a second start while the first is pending and keeps command errors visible", async () => {
     const service = fixture(true);
     let rejectStart!: (reason: Error) => void;
-    vi.mocked(service.start).mockImplementation(
+    vi.mocked(service.startAutomatic).mockImplementation(
       () =>
         new Promise<void>((_, reject) => {
           rejectStart = reject;
@@ -273,7 +480,7 @@ describe("Deep Analysis desktop workflow", () => {
     await render(service);
     await click("Start analysis");
     await click("Start analysis");
-    expect(service.start).toHaveBeenCalledTimes(1);
+    expect(service.startAutomatic).toHaveBeenCalledTimes(1);
     await act(async () => rejectStart(new Error("engine process unavailable")));
     expect(host.textContent).toContain("engine process unavailable");
     expect(host.textContent).toContain("Opening study");
@@ -311,7 +518,7 @@ describe("Deep Analysis desktop workflow", () => {
     );
     expect(start?.disabled).toBe(true);
     await click("Start analysis");
-    expect(service.start).not.toHaveBeenCalled();
+    expect(service.startAutomatic).not.toHaveBeenCalled();
   });
 
   it("creates a named project with time/MultiPV and its root already persisted, then controls analysis", async () => {
@@ -334,7 +541,7 @@ describe("Deep Analysis desktop workflow", () => {
     expect(host.textContent).toContain(FEN);
     expect(host.textContent).toContain("10 seconds");
     await click("Start analysis");
-    expect(service.start).toHaveBeenCalledWith("p1");
+    expect(service.startAutomatic).toHaveBeenCalledWith("p1");
     expect(host.textContent).toContain("Depth 18");
     expect(host.textContent).toContain("+0.37");
     expect(host.textContent).toContain("e2e4 e7e5");
@@ -400,7 +607,7 @@ describe("Deep Analysis desktop workflow", () => {
     const service = fixture();
     await render(service, []);
     await act(async () =>
-      root.render(
+      root!.render(
         <MantineProvider>
           <DeepAnalysisPage
             service={service}

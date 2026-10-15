@@ -132,6 +132,45 @@ pub struct DeepAnalysisResult {
     pub task_id: String,
     pub lines: Vec<DeepAnalysisLine>,
 }
+#[derive(Debug, Clone, Copy, Serialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisChange {
+    ProjectStateChanged,
+    SchedulerStageChanged,
+    TaskQueued,
+    TaskStarted,
+    TaskCompleted,
+    TreeNodeUpdated,
+    MinimaxUpdated,
+    EngineStateChanged,
+    ProjectExhausted,
+    ProjectFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisUpdate {
+    pub project_id: String,
+    pub kind: AnalysisChange,
+    pub task_id: Option<String>,
+}
+
+fn emit_update(
+    app: &tauri::AppHandle,
+    project_id: &str,
+    kind: AnalysisChange,
+    task_id: Option<&str>,
+) {
+    let _ = AnalysisUpdate::emit(
+        &AnalysisUpdate {
+            project_id: project_id.into(),
+            kind,
+            task_id: task_id.map(str::to_owned),
+        },
+        app,
+    );
+}
+
 #[derive(Debug, Clone, Serialize, Type, Event)]
 #[serde(rename_all = "camelCase")]
 pub struct DeepAnalysisProgress {
@@ -278,6 +317,18 @@ impl Store {
         } else {
             Ok(())
         }
+    }
+    fn prepare_automatic_project(&self, id: &str) -> Result<(), String> {
+        let project = self.get_project(id)?.ok_or("analysis project not found")?;
+        if self.automatic(id)?.is_none() {
+            let settings = scheduler::AnalysisSettings {
+                analysis_time_ms: project.time_ms,
+                engine_id: project.engine,
+                ..Default::default()
+            };
+            self.enable_automatic(id, &settings)?;
+        }
+        Ok(())
     }
     fn automatic(
         &self,
@@ -1161,6 +1212,99 @@ pub fn create_deep_analysis_project(
 }
 #[tauri::command]
 #[specta::specta]
+pub fn list_deep_analysis_summaries(
+    app: tauri::AppHandle,
+) -> Result<Vec<read::AnalysisProjectSummary>, String> {
+    let s = store(&app)?;
+    s.list_projects()?
+        .iter()
+        .map(|p| s.read_project_summary(&p.id))
+        .collect()
+}
+#[tauri::command]
+#[specta::specta]
+pub fn get_deep_analysis_summary(
+    app: tauri::AppHandle,
+    project_id: String,
+) -> Result<read::AnalysisProjectSummary, String> {
+    store(&app)?.read_project_summary(&project_id)
+}
+#[tauri::command]
+#[specta::specta]
+pub fn get_deep_analysis_tree(
+    app: tauri::AppHandle,
+    project_id: String,
+) -> Result<Vec<read::AnalysisNodeView>, String> {
+    store(&app)?.read_tree(&project_id)
+}
+#[tauri::command]
+#[specta::specta]
+pub fn get_deep_analysis_node(
+    app: tauri::AppHandle,
+    project_id: String,
+    node_id: String,
+) -> Result<read::AnalysisNodeView, String> {
+    node_id
+        .parse::<i64>()
+        .map_err(|_| "invalid analysis node id")?;
+    store(&app)?
+        .read_tree(&project_id)?
+        .into_iter()
+        .find(|node| node.id == node_id)
+        .ok_or("analysis node not found".into())
+}
+#[tauri::command]
+#[specta::specta]
+pub fn get_deep_analysis_task_views(
+    app: tauri::AppHandle,
+    project_id: String,
+) -> Result<Vec<read::AnalysisTaskView>, String> {
+    store(&app)?.read_tasks(&project_id)
+}
+#[tauri::command]
+#[specta::specta]
+pub fn get_deep_analysis_scheduler(
+    app: tauri::AppHandle,
+    project_id: String,
+) -> Result<read::SchedulerView, String> {
+    store(&app)?.read_scheduler(&project_id)
+}
+#[tauri::command]
+#[specta::specta]
+pub async fn start_automatic_deep_analysis(
+    app: tauri::AppHandle,
+    project_id: String,
+    state: tauri::State<'_, DeepAnalysisState>,
+) -> Result<(), String> {
+    store(&app)?.prepare_automatic_project(&project_id)?;
+    launch(app, project_id, &state).await
+}
+#[tauri::command]
+#[specta::specta]
+pub fn manual_prolong_deep_analysis(
+    app: tauri::AppHandle,
+    project_id: String,
+    node_id: String,
+    count: u8,
+) -> Result<DeepAnalysisTask, String> {
+    let node_id = node_id
+        .parse::<i64>()
+        .map_err(|_| "invalid analysis node id")?;
+    let s = store(&app)?;
+    let task = s.manual_prolong(&project_id, node_id, count)?;
+    emit_update(
+        &app,
+        &project_id,
+        AnalysisChange::TaskQueued,
+        Some(&task.id),
+    );
+    let _ =
+        DeepAnalysisProgress::emit(&s.progress(&project_id, Some(task.id.clone()), None)?, &app);
+    Ok(task)
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn list_deep_analysis_projects(
     app: tauri::AppHandle,
 ) -> Result<Vec<DeepAnalysisProject>, String> {
@@ -1190,7 +1334,14 @@ pub fn queue_deep_analysis_root(
     fen: String,
     ply: u32,
 ) -> Result<DeepAnalysisTask, String> {
-    store(&app)?.queue_root(&project_id, &fen, ply)
+    let task = store(&app)?.queue_root(&project_id, &fen, ply)?;
+    emit_update(
+        &app,
+        &project_id,
+        AnalysisChange::TaskQueued,
+        Some(&task.id),
+    );
+    Ok(task)
 }
 #[tauri::command]
 #[specta::specta]
@@ -1203,16 +1354,25 @@ pub fn queue_deep_analysis_continuation(
     occurrence_id: Option<i64>,
 ) -> Result<DeepAnalysisTask, String> {
     let s = store(&app)?;
-    match occurrence_id {
+    let task = match occurrence_id {
         Some(id) => s.queue_at_occurrence(&project_id, &parent_task_id, &fen, ply, id),
         None => s.queue(&project_id, Some(&parent_task_id), &fen, ply),
-    }
+    }?;
+    emit_update(
+        &app,
+        &project_id,
+        AnalysisChange::TaskQueued,
+        Some(&task.id),
+    );
+    Ok(task)
 }
 #[tauri::command]
 #[specta::specta]
 pub fn pause_deep_analysis(app: tauri::AppHandle, project_id: String) -> Result<(), String> {
     let s = store(&app)?;
     app.state::<DeepAnalysisState>().pause(&s, &project_id)?;
+    emit_update(&app, &project_id, AnalysisChange::ProjectStateChanged, None);
+    emit_update(&app, &project_id, AnalysisChange::EngineStateChanged, None);
     let _ = DeepAnalysisProgress::emit(&s.progress(&project_id, None, None)?, &app);
     Ok(())
 }
@@ -1229,6 +1389,8 @@ pub async fn stop_deep_analysis(
     if active {
         drop(state.acquire_after_drain(&project_id).await?);
     }
+    emit_update(&app, &project_id, AnalysisChange::ProjectStateChanged, None);
+    emit_update(&app, &project_id, AnalysisChange::EngineStateChanged, None);
     let _ = DeepAnalysisProgress::emit(&s.progress(&project_id, None, None)?, &app);
     Ok(())
 }
@@ -1237,6 +1399,7 @@ pub async fn stop_deep_analysis(
 pub fn cancel_deep_analysis(app: tauri::AppHandle, project_id: String) -> Result<(), String> {
     let s = store(&app)?;
     app.state::<DeepAnalysisState>().cancel(&s, &project_id)?;
+    emit_update(&app, &project_id, AnalysisChange::ProjectStateChanged, None);
     let _ = DeepAnalysisProgress::emit(&s.progress(&project_id, None, None)?, &app);
     Ok(())
 }
@@ -1286,6 +1449,8 @@ async fn launch(
         ));
     }
     s.begin_running(&project_id, &initial_status)?;
+    emit_update(&app, &project_id, AnalysisChange::ProjectStateChanged, None);
+    emit_update(&app, &project_id, AnalysisChange::EngineStateChanged, None);
     tauri::async_runtime::spawn(async move {
         let cancelled = lease.cancelled.clone();
         let _lease = lease;
@@ -1293,6 +1458,8 @@ async fn launch(
             log::error!("Deep analysis worker {}: {}", project_id, e);
             if let Ok(s) = store(&app) {
                 let _ = s.fail_worker(&project_id, &e);
+                emit_update(&app, &project_id, AnalysisChange::ProjectFailed, None);
+                emit_update(&app, &project_id, AnalysisChange::EngineStateChanged, None);
                 if let Ok(progress) = s.progress(&project_id, None, Some(e)) {
                     let _ = progress.emit(&app);
                 }
@@ -1316,18 +1483,25 @@ async fn run_worker(
                 break;
             }
             if s.generate_next(project_id)? {
+                emit_update(app, project_id, AnalysisChange::SchedulerStageChanged, None);
+                let _ = DeepAnalysisProgress::emit(&s.progress(project_id, None, None)?, app);
                 continue;
             }
             if !s.finish(project_id)? {
                 continue; // Queue won the race after claim returned None.
             }
+            emit_update(app, project_id, AnalysisChange::ProjectExhausted, None);
+            emit_update(app, project_id, AnalysisChange::EngineStateChanged, None);
             let _ = DeepAnalysisProgress::emit(&s.progress(project_id, None, None)?, app);
             break;
         };
+        emit_update(app, project_id, AnalysisChange::TaskStarted, Some(&task.id));
+        let _ =
+            DeepAnalysisProgress::emit(&s.progress(project_id, Some(task.id.clone()), None)?, app);
         let project = s.get_project(project_id)?.ok_or("project not found")?;
         let outcome = match cached_for_project(&s, &project, &task) {
             Ok(Some(lines)) => Ok((lines, None)),
-            Ok(None) => analyze_position_timed(&project, &task, &s, cancelled)
+            Ok(None) => analyze_position_timed(&project, &task, &s, cancelled, Some(app))
                 .await
                 .map(|(lines, ms)| (lines, Some(ms))),
             Err(e) => Err(e),
@@ -1365,6 +1539,24 @@ async fn run_worker(
                 continue;
             }
         }
+        emit_update(
+            app,
+            project_id,
+            AnalysisChange::TaskCompleted,
+            Some(&task.id),
+        );
+        emit_update(
+            app,
+            project_id,
+            AnalysisChange::TreeNodeUpdated,
+            Some(&task.id),
+        );
+        emit_update(
+            app,
+            project_id,
+            AnalysisChange::MinimaxUpdated,
+            Some(&task.id),
+        );
         let _ = DeepAnalysisProgress::emit(&s.progress(project_id, Some(task.id), None)?, app);
     }
     Ok(())
@@ -1391,13 +1583,16 @@ async fn analyze_position(
     s: &Store,
     cancelled: &AtomicBool,
 ) -> Result<Vec<DeepAnalysisLine>, String> {
-    Ok(analyze_position_timed(project, task, s, cancelled).await?.0)
+    Ok(analyze_position_timed(project, task, s, cancelled, None)
+        .await?
+        .0)
 }
 async fn analyze_position_timed(
     project: &DeepAnalysisProject,
     task: &DeepAnalysisTask,
     s: &Store,
     cancelled: &AtomicBool,
+    event_app: Option<&tauri::AppHandle>,
 ) -> Result<(Vec<DeepAnalysisLine>, u64), String> {
     let requested = s.automatic(&project.id)?.map(|(settings, _, _)| settings);
     let requested_time = requested
@@ -1447,6 +1642,7 @@ async fn analyze_position_timed(
         let started = std::time::Instant::now();
         let mut stop_at = None::<std::time::Instant>;
         let mut best = std::collections::BTreeMap::<u16, DeepAnalysisLine>::new();
+        let mut last_update = std::time::Instant::now() - Duration::from_secs(1);
         loop {
             let next = tokio::time::timeout(Duration::from_millis(50), reader.next_line()).await;
             if cancelled.load(Ordering::Acquire) || s.status(&project.id)? != "running" {
@@ -1469,6 +1665,15 @@ async fn analyze_position_timed(
                         {
                             s.snapshot(&task.id, &parsed)?;
                             best.insert(parsed.multipv, parsed);
+                            if let Some(app) = event_app {
+                                if last_update.elapsed() >= Duration::from_millis(800) {
+                                    let _ = DeepAnalysisProgress::emit(
+                                        &s.progress(&project.id, Some(task.id.clone()), None)?,
+                                        app,
+                                    );
+                                    last_update = std::time::Instant::now();
+                                }
+                            }
                         }
                     }
                 }
@@ -1581,7 +1786,7 @@ async fn drive_debug_analysis(db: &Path, id: &str, max_results: u32) -> Result<S
         };
         let outcome = match cached_for_project(&s, &project, &task) {
             Ok(Some(lines)) => Ok((lines, None)),
-            Ok(None) => analyze_position_timed(&project, &task, &s, &AtomicBool::new(false))
+            Ok(None) => analyze_position_timed(&project, &task, &s, &AtomicBool::new(false), None)
                 .await
                 .map(|(lines, ms)| (lines, Some(ms))),
             Err(e) => Err(e),
@@ -1665,6 +1870,37 @@ pub fn show_debug_analysis(db: &Path, id: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn analysis_update_event_kinds_have_stable_ui_names() {
+        assert_eq!(
+            serde_json::to_string(&AnalysisChange::TreeNodeUpdated).unwrap(),
+            "\"tree_node_updated\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AnalysisChange::ProjectExhausted).unwrap(),
+            "\"project_exhausted\""
+        );
+    }
+
+    #[test]
+    fn automatic_project_start_uses_its_persisted_engine_and_time_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("analysis.sqlite")).unwrap();
+        let engine = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let project = store
+            .create_project("UI study", &engine, 750, 2, &start_fen(), &[])
+            .unwrap();
+        store.prepare_automatic_project(&project.id).unwrap();
+        let (settings, cycle, _) = store.automatic(&project.id).unwrap().unwrap();
+        assert_eq!(settings.analysis_time_ms, 750);
+        assert_eq!(settings.engine_id, engine);
+        assert_eq!(cycle, 0);
+        assert!(store.prepare_automatic_project("missing-project").is_err());
+    }
+
     #[test]
     fn creation_is_atomic_and_preserves_position_history_and_time() {
         let dir = tempfile::tempdir().unwrap();

@@ -606,6 +606,70 @@ async createDeepAnalysisProject(title: string, engine: string, timeMs: number, m
     else return { status: "error", error: e  as any };
 }
 },
+async listDeepAnalysisSummaries() : Promise<Result<AnalysisProjectSummary[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_deep_analysis_summaries") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getDeepAnalysisSummary(projectId: string) : Promise<Result<AnalysisProjectSummary, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_deep_analysis_summary", { projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getDeepAnalysisTree(projectId: string) : Promise<Result<AnalysisNodeView[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_deep_analysis_tree", { projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getDeepAnalysisNode(projectId: string, nodeId: string) : Promise<Result<AnalysisNodeView, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_deep_analysis_node", { projectId, nodeId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getDeepAnalysisTaskViews(projectId: string) : Promise<Result<AnalysisTaskView[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_deep_analysis_task_views", { projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getDeepAnalysisScheduler(projectId: string) : Promise<Result<SchedulerView, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_deep_analysis_scheduler", { projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async startAutomaticDeepAnalysis(projectId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_automatic_deep_analysis", { projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async manualProlongDeepAnalysis(projectId: string, nodeId: string, count: number) : Promise<Result<DeepAnalysisTask, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("manual_prolong_deep_analysis", { projectId, nodeId, count }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async listDeepAnalysisProjects() : Promise<Result<DeepAnalysisProject[], string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_deep_analysis_projects") };
@@ -692,12 +756,14 @@ async cancelDeepAnalysis(projectId: string) : Promise<Result<null, string>> {
 
 
 export const events = __makeEvents__<{
+analysisUpdate: AnalysisUpdate,
 bestMovesPayload: BestMovesPayload,
 databaseProgress: DatabaseProgress,
 deepAnalysisProgress: DeepAnalysisProgress,
 downloadProgress: DownloadProgress,
 reportProgress: ReportProgress
 }>({
+analysisUpdate: "analysis-update",
 bestMovesPayload: "best-moves-payload",
 databaseProgress: "database-progress",
 deepAnalysisProgress: "deep-analysis-progress",
@@ -711,10 +777,15 @@ reportProgress: "report-progress"
 
 /** user-defined types **/
 
+export type AnalysisChange = "project_state_changed" | "scheduler_stage_changed" | "task_queued" | "task_started" | "task_completed" | "tree_node_updated" | "minimax_updated" | "engine_state_changed" | "project_exhausted" | "project_failed"
+export type AnalysisNodeView = { id: string; parentId: string | null; moveUci: string | null; moveSan: string | null; fen: string; sideToMove: string; rawEvaluation: EvaluationView; treeIndex: number | null; depth: number | null; elapsedMs: number | null; pv: string[]; engine: string | null; minimaxEvaluation: EvaluationView; status: string; transpositionLinked: boolean }
 /**
  * Options for full-game analysis (FEN, moves, novelty annotation, etc).
  */
 export type AnalysisOptions = { fen: string; moves: string[]; annotateNovelties: boolean; referenceDb: string | null; reversed: boolean }
+export type AnalysisProjectSummary = { id: string; name: string; rootFen: string; schedulerState: string; currentStage: string | null; engine: string; createdAt: string; updatedAt: string | null; taskCounts: TaskCounts; analysedNodeCount: number }
+export type AnalysisTaskView = { id: string; strategy: string; priority: number; sourceNodeId: string | null; positionFen: string; state: string; requestedTimeMs: number | null; requestedDepth: number | null; operationMode: string | null; remainingProlongCount: number; engine: string; createdAt: string | null }
+export type AnalysisUpdate = { projectId: string; kind: AnalysisChange; taskId: string | null }
 /**
  * Best-move line from engine output, including PV, score, and stats.
  */
@@ -747,6 +818,7 @@ export type EngineOption = { name: string; value: string }
  * Options for configuring engine analysis (FEN, moves, extra UCI options).
  */
 export type EngineOptions = { fen: string; moves: string[]; extraOptions: EngineOption[] }
+export type EvaluationView = { kind: "centipawns"; value: number; display: string } | { kind: "mate"; distance: number; display: string } | { kind: "unknown" }
 export type Event = { id: number; name: string | null }
 export type FidePlayer = { fideid: number; name: string; country: string; sex: string; title: string | null; w_title: string | null; o_title: string | null; foa_title: string | null; rating: number | null; games: number | null; k: number | null; rapid_rating: number | null; rapid_games: number | null; rapid_k: number | null; blitz_rating: number | null; blitz_games: number | null; blitz_k: number | null; birthday: number | null; flag: string | null }
 export type FileMetadata = { last_modified: bigint; size: bigint; is_dir: boolean; is_readonly: boolean }
@@ -865,6 +937,7 @@ export type QueryResponse<T> = { data: T; count: number | null }
  * Event payload for reporting analysis progress.
  */
 export type ReportProgress = { progress: number; id: string; finished: boolean }
+export type SchedulerView = { state: string; cycle: string; stage: string | null; queueLength: number; activeTaskId: string | null; completedCount: number; emptyStageCount: number; exhausted: boolean; engineState: string }
 export type Score = { value: ScoreValue; 
 /**
  * The probability of each result (win, draw, loss).
@@ -883,6 +956,7 @@ export type Sides = "BlackWhite" | "WhiteBlack" | "Any"
 export type SiteStatsData = { site: string; player: string; data: StatsData[] }
 export type SortDirection = "asc" | "desc"
 export type StatsData = { date: string; is_player_white: boolean; player_elo: number; result: GameOutcome; time_control: string; opening: string }
+export type TaskCounts = { queued: number; running: number; completed: number; failed: number; cancelled: number }
 export type TelemetryConfig = { enabled: boolean; initial_run_completed: boolean }
 export type Token = { type: "ParenOpen" } | { type: "ParenClose" } | { type: "Comment"; value: string } | { type: "San"; value: string } | { type: "Header"; value: { tag: string; value: string } } | { type: "Nag"; value: string } | { type: "Outcome"; value: string }
 export type TournamentQuery = { options: QueryOptions<TournamentSort>; name: string | null }

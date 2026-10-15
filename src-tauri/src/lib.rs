@@ -28,12 +28,14 @@ use chess::{BestMovesPayload, EngineProcess, ReportProgress};
 use dashmap::DashMap;
 use db::{DatabaseProgress, GameQueryJs, NormalizedGame, PositionStats};
 use deep_analysis::{
-    cancel_deep_analysis, create_deep_analysis_project, list_deep_analysis_projects,
-    list_deep_analysis_results, list_deep_analysis_tasks, pause_deep_analysis,
-    queue_deep_analysis_continuation, queue_deep_analysis_root, resume_deep_analysis,
-    start_deep_analysis, stop_deep_analysis,
+    cancel_deep_analysis, create_deep_analysis_project, get_deep_analysis_node,
+    get_deep_analysis_scheduler, get_deep_analysis_summary, get_deep_analysis_task_views,
+    get_deep_analysis_tree, list_deep_analysis_projects, list_deep_analysis_results,
+    list_deep_analysis_summaries, list_deep_analysis_tasks, manual_prolong_deep_analysis,
+    pause_deep_analysis, queue_deep_analysis_continuation, queue_deep_analysis_root,
+    resume_deep_analysis, start_automatic_deep_analysis, start_deep_analysis, stop_deep_analysis,
 };
-use deep_analysis::{DeepAnalysisProgress, DeepAnalysisState};
+use deep_analysis::{AnalysisUpdate, DeepAnalysisProgress, DeepAnalysisState};
 use derivative::Derivative;
 use fide::FidePlayer;
 use oauth::AuthState;
@@ -184,6 +186,14 @@ pub async fn run() {
             open_external_link,
             get_sound_server_port,
             create_deep_analysis_project,
+            list_deep_analysis_summaries,
+            get_deep_analysis_summary,
+            get_deep_analysis_tree,
+            get_deep_analysis_node,
+            get_deep_analysis_task_views,
+            get_deep_analysis_scheduler,
+            start_automatic_deep_analysis,
+            manual_prolong_deep_analysis,
             list_deep_analysis_projects,
             list_deep_analysis_tasks,
             list_deep_analysis_results,
@@ -200,7 +210,8 @@ pub async fn run() {
             DatabaseProgress,
             DownloadProgress,
             ReportProgress,
-            DeepAnalysisProgress
+            DeepAnalysisProgress,
+            AnalysisUpdate
         ));
 
     #[cfg(all(debug_assertions, not(target_os = "android")))]

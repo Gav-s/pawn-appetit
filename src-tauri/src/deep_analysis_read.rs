@@ -55,8 +55,8 @@ pub struct AnalysisProjectSummary {
 #[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisNodeView {
-    pub id: i64,
-    pub parent_id: Option<i64>,
+    pub id: String,
+    pub parent_id: Option<String>,
     pub move_uci: Option<String>,
     pub move_san: Option<String>,
     pub fen: String,
@@ -64,7 +64,7 @@ pub struct AnalysisNodeView {
     pub raw_evaluation: EvaluationView,
     pub tree_index: Option<u8>,
     pub depth: Option<u32>,
-    pub elapsed_ms: Option<u64>,
+    pub elapsed_ms: Option<u32>,
     pub pv: Vec<String>,
     pub engine: Option<String>,
     pub minimax_evaluation: EvaluationView,
@@ -77,7 +77,7 @@ pub struct AnalysisTaskView {
     pub id: String,
     pub strategy: String,
     pub priority: u8,
-    pub source_node_id: Option<i64>,
+    pub source_node_id: Option<String>,
     pub position_fen: String,
     pub state: String,
     pub requested_time_ms: Option<u32>,
@@ -91,7 +91,7 @@ pub struct AnalysisTaskView {
 #[serde(rename_all = "camelCase")]
 pub struct SchedulerView {
     pub state: String,
-    pub cycle: u64,
+    pub cycle: String,
     pub stage: Option<String>,
     pub queue_length: u32,
     pub active_task_id: Option<String>,
@@ -239,8 +239,8 @@ impl Store {
                     "unanalysed"
                 };
                 Ok(AnalysisNodeView {
-                    id: n.id,
-                    parent_id: n.parent_id,
+                    id: n.id.to_string(),
+                    parent_id: n.parent_id.map(|id| id.to_string()),
                     move_uci: n.move_uci,
                     move_san,
                     fen: n.fen,
@@ -280,7 +280,7 @@ impl Store {
                     strategy: r.get(3)?,
                     priority: r.get(4)?,
                     remaining_prolong_count: r.get(5)?,
-                    source_node_id: r.get(6)?,
+                    source_node_id: r.get::<_, Option<i64>>(6)?.map(|id| id.to_string()),
                     requested_time_ms: None,
                     requested_depth: None,
                     operation_mode: None,
@@ -313,7 +313,7 @@ impl Store {
         };
         Ok(SchedulerView {
             state: summary.scheduler_state.clone(),
-            cycle,
+            cycle: cycle.to_string(),
             stage: summary.current_stage,
             queue_length: summary.task_counts.queued,
             active_task_id,
@@ -370,6 +370,24 @@ pub(super) fn restore_missing_roots(conn: &mut Connection) -> Result<(), String>
 mod tests {
     use super::EvaluationView;
     use crate::deep_analysis::{parse_line, start_fen, Store};
+
+    #[test]
+    fn node_ids_are_json_safe_strings_for_tauri() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db")).unwrap();
+        let p = store
+            .create_project(
+                "IDs",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                100,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        let node = store.read_tree(&p.id).unwrap().remove(0);
+        assert!(serde_json::to_value(&node).unwrap()["id"].is_string());
+    }
 
     #[test]
     fn pending_legacy_project_reopens_with_a_visible_root_occurrence() {
@@ -453,7 +471,7 @@ mod tests {
         assert_eq!(nodes[0].status, "analysed");
         assert_eq!(nodes[1].move_san.as_deref(), Some("e4"));
         assert_eq!(nodes[1].side_to_move, "black");
-        assert_eq!(nodes[1].parent_id, Some(nodes[0].id));
+        assert_eq!(nodes[1].parent_id, Some(nodes[0].id.clone()));
         assert!(!nodes[1].transposition_linked);
         assert_eq!(nodes[1].elapsed_ms, None);
     }
@@ -487,7 +505,8 @@ mod tests {
         assert_eq!(priority.priority, 1);
         assert_eq!(priority.requested_time_ms, None); // legacy intent is unknown, not inferred
         let scheduler = reopened.read_scheduler(&p.id).unwrap();
-        assert_eq!(scheduler.cycle, 0);
+        assert!(serde_json::to_value(&scheduler).unwrap()["cycle"].is_string());
+        assert_eq!(scheduler.cycle, "0");
         assert_eq!(scheduler.queue_length, 2);
         assert_eq!(scheduler.active_task_id, None);
     }
