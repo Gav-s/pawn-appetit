@@ -423,9 +423,74 @@ describe("Deep Analysis desktop workflow", () => {
       await click(move);
       expect(selectedFen()).toBe(finalFen);
       expect(tree.querySelector(`[aria-selected="true"]`)?.textContent).toBe(move);
-      expect([...board.querySelectorAll("piece.white.knight")].map((piece) => piece.getAttribute("style")))
-        .toEqual(expect.arrayContaining(["transform: translate(200px,500px);", "transform: translate(500px,500px);"]));
+      expect(
+        [...board.querySelectorAll("piece.white.knight")].map((piece) =>
+          piece.getAttribute("style"),
+        ),
+      ).toEqual(
+        expect.arrayContaining([
+          "transform: translate(200px,500px);",
+          "transform: translate(500px,500px);",
+        ]),
+      );
     }
+  });
+
+  it("refreshes shared evaluation on both transposed paths while keeping path minimax separate", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const service = fixture(true);
+    const first: AnalysisNodeView = {
+      ...rootNode,
+      id: "8",
+      parentId: "7",
+      positionId: "42",
+      transpositionCount: 2,
+      transpositionLinked: true,
+      moveUci: "b8c6",
+      moveSan: "Nc6",
+      status: "unanalysed",
+    };
+    const second: AnalysisNodeView = {
+      ...first,
+      id: "9",
+      parentId: "6",
+      moveUci: "g8f6",
+      moveSan: "Nf6",
+    };
+    vi.mocked(service.getTree).mockResolvedValue([rootNode, first, second]);
+    await render(service);
+    await click("Nc6");
+    expect(host.textContent).toContain("Raw evaluation Unknown");
+    const updated = { kind: "centipawns", value: 28, display: "+0.28" } as const;
+    vi.mocked(service.getTree).mockResolvedValue([
+      rootNode,
+      {
+        ...first,
+        rawEvaluation: updated,
+        treeIndex: 52,
+        minimaxEvaluation: updated,
+        status: "analysed",
+      },
+      {
+        ...second,
+        rawEvaluation: updated,
+        treeIndex: 52,
+        minimaxEvaluation: { kind: "centipawns", value: 16, display: "+0.16" },
+        status: "analysed",
+      },
+    ]);
+    await act(async () =>
+      service.emitUpdate({ projectId: "p1", kind: "tree_node_updated", taskId: "t1" }),
+    );
+    const tree = host.querySelector('[role="tree"]')!;
+    expect(tree.textContent?.match(/#52/g)).toHaveLength(2);
+    expect(host.textContent).toContain("Raw evaluation +0.28");
+    expect(host.textContent).toContain("Minimax +0.28");
+    await click("Nf6");
+    expect(host.textContent).toContain("Raw evaluation +0.28");
+    expect(host.textContent).toContain("Minimax +0.16");
+    expect(service.getTree).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
   });
 
   it("starts automatic analysis from the persisted project and stops while retaining work", async () => {

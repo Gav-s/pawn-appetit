@@ -1,6 +1,6 @@
 //! Immutable execution requirements captured when a task is queued.
 use super::{scheduler::AnalysisOperation, Store};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 #[derive(Debug, Clone)]
 pub(super) struct TaskExecution {
@@ -54,6 +54,129 @@ pub(super) fn migrate(conn: &mut Connection) -> Result<(), String> {
     ))
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
+}
+
+/// Snapshot the canonical target and all interested occurrence paths. Legacy tasks
+/// remain intact; equivalent queued searches are merged without dropping their reasons.
+pub(super) fn migrate_graph(conn: &mut Connection) -> Result<(), String> {
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let has_target = tx
+        .prepare("PRAGMA table_info(deep_tasks)")
+        .map_err(|e| e.to_string())?
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|column| column == "position_id");
+    if !has_target {
+        tx.execute_batch("ALTER TABLE deep_tasks ADD COLUMN position_id INTEGER REFERENCES deep_position_records(id)")
+            .map_err(|e|e.to_string())?;
+    }
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS deep_task_interests (
+            task_id TEXT NOT NULL REFERENCES deep_tasks(id) ON DELETE CASCADE,
+            node_id INTEGER NOT NULL REFERENCES deep_tree_nodes(id) ON DELETE CASCADE,
+            reason TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            remaining_prolong INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(task_id,node_id,reason)
+         );
+         CREATE INDEX IF NOT EXISTS deep_task_interests_node ON deep_task_interests(node_id);
+         CREATE INDEX IF NOT EXISTS deep_tasks_position_status ON deep_tasks(position_id,status);
+         DROP INDEX IF EXISTS deep_tasks_one_equivalent_pending;
+         UPDATE deep_tasks SET position_id=(
+            SELECT n.position_id FROM deep_tree_nodes n
+            WHERE n.project_id=deep_tasks.project_id AND (
+                n.id=deep_tasks.occurrence_id OR
+                (deep_tasks.occurrence_id IS NULL AND n.source_task_id=deep_tasks.id AND n.parent_id IS NULL))
+            ORDER BY n.id LIMIT 1)
+         WHERE position_id IS NULL;
+         INSERT OR IGNORE INTO deep_task_interests(task_id,node_id,reason,priority,remaining_prolong)
+         SELECT t.id,n.id,t.strategy,t.priority,t.remaining_prolong FROM deep_tasks t
+         JOIN deep_tree_nodes n ON n.project_id=t.project_id AND (
+            n.id=t.occurrence_id OR (t.occurrence_id IS NULL AND n.source_task_id=t.id AND n.parent_id IS NULL));",
+    ).map_err(|e|e.to_string())?;
+    type Key = (String, i64, String, String, u16, u32, u32, String);
+    let pending = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT id,project_id,position_id,execution_engine,engine_profile,
+            requested_multipv,requested_time_ms,requested_depth,operation_mode,status
+            FROM deep_tasks WHERE status IN ('queued','running') AND position_id IS NOT NULL
+            ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END,rowid",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, u16>(5)?,
+                        r.get::<_, u32>(6)?,
+                        r.get::<_, u32>(7)?,
+                        r.get::<_, String>(8)?,
+                    ),
+                    r.get::<_, String>(9)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        rows
+    };
+    let mut winners = std::collections::HashMap::<Key, String>::new();
+    for (task_id, key, _status) in pending {
+        if let Some(winner) = winners.get(&key) {
+            tx.execute("INSERT OR IGNORE INTO deep_task_interests(task_id,node_id,reason,priority,remaining_prolong)
+                SELECT ?1,node_id,reason,priority,remaining_prolong FROM deep_task_interests WHERE task_id=?2",
+                params![winner,task_id]).map_err(|e|e.to_string())?;
+            tx.execute("UPDATE deep_tasks SET priority=MAX(priority,(SELECT priority FROM deep_tasks WHERE id=?2)),
+                remaining_prolong=MAX(remaining_prolong,(SELECT remaining_prolong FROM deep_tasks WHERE id=?2)) WHERE id=?1",
+                params![winner,task_id]).map_err(|e|e.to_string())?;
+            tx.execute(
+                "UPDATE deep_tasks SET status='cancelled',error=?2 WHERE id=?1",
+                params![task_id, format!("coalesced into {winner}")],
+            )
+            .map_err(|e| e.to_string())?;
+            log::debug!("Coalesced persisted task {task_id} into {winner}");
+        } else {
+            winners.insert(key, task_id);
+        }
+    }
+    tx.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS deep_tasks_one_equivalent_pending
+        ON deep_tasks(project_id,position_id,execution_engine,engine_profile,
+            requested_multipv,requested_time_ms,requested_depth,operation_mode)
+        WHERE position_id IS NOT NULL AND status IN ('queued','running');
+        PRAGMA user_version=6;",
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
+pub(super) fn add_interest(
+    tx: &Transaction<'_>,
+    task_id: &str,
+    node_id: i64,
+    reason: &str,
+    priority: i64,
+    remaining_prolong: u8,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO deep_task_interests(task_id,node_id,reason,priority,remaining_prolong)
+        VALUES(?1,?2,?3,?4,?5)
+        ON CONFLICT(task_id,node_id,reason) DO UPDATE SET
+            priority=MAX(priority,excluded.priority),
+            remaining_prolong=MAX(remaining_prolong,excluded.remaining_prolong)",
+        params![task_id, node_id, reason, priority, remaining_prolong],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 impl Store {

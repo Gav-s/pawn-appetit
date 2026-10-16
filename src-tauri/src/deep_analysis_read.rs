@@ -130,7 +130,11 @@ impl Store {
         let project = self.get_project(id)?.ok_or("analysis project not found")?;
         let conn = self.conn()?;
         let root_fen: String = conn.query_row("SELECT fen FROM deep_tree_nodes WHERE project_id=?1 AND parent_id IS NULL ORDER BY id LIMIT 1", [id], |r| r.get(0)).map_err(|e| e.to_string())?;
-        let analysed_node_count: u32 = conn.query_row("SELECT count(*) FROM deep_tree_nodes WHERE project_id=?1 AND direct_score_kind IS NOT NULL", [id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        let analysed_node_count: u32 = conn.query_row("SELECT count(*) FROM deep_tree_nodes n JOIN deep_projects p ON p.id=n.project_id
+            WHERE n.project_id=?1 AND (n.direct_score_kind IS NOT NULL OR EXISTS (
+              SELECT 1 FROM deep_position_evaluations e WHERE e.position_id=n.position_id
+                AND e.engine=p.engine AND e.engine_profile='default' AND e.context_key='fen_only'))",
+            [id], |r| r.get(0)).map_err(|e| e.to_string())?;
         let mut counts = TaskCounts {
             queued: 0,
             running: 0,
@@ -171,14 +175,22 @@ impl Store {
             .ok_or("analysis project not found")?
             .engine;
         let conn = self.conn()?;
-        let mut stmt=conn.prepare("SELECT n.id,n.parent_id,n.move_uci,n.fen,p.fen,n.direct_score_kind,n.direct_score_value,
-           n.minimax_score_kind,n.minimax_score_value,n.direct_depth,r.uci_moves,n.analyzed_task_id,
+        let mut stmt=conn.prepare("SELECT n.id,n.parent_id,n.move_uci,n.fen,p.fen,
+           COALESCE(e.score_kind,n.direct_score_kind),COALESCE(e.score_value,n.direct_score_value),
+           n.minimax_score_kind,n.minimax_score_value,COALESCE(e.depth,n.direct_depth),
+           COALESCE(e.pv_json,r.uci_moves),COALESCE(e.task_id,n.analyzed_task_id),
            (SELECT t.status FROM deep_tasks t WHERE t.occurrence_id=n.id ORDER BY CASE t.status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,t.rowid DESC LIMIT 1),
            src.status,n.position_id,
            (SELECT count(*) FROM deep_tree_nodes other
             WHERE other.project_id=n.project_id AND other.position_id=n.position_id)
            FROM deep_tree_nodes n LEFT JOIN deep_tree_nodes p ON p.id=n.parent_id
+           JOIN deep_projects project ON project.id=n.project_id
            JOIN deep_tasks src ON src.id=n.source_task_id
+           LEFT JOIN deep_position_evaluations e ON e.task_id=(
+             SELECT selected.task_id FROM deep_position_evaluations selected
+             WHERE selected.position_id=n.position_id AND selected.engine=project.engine
+               AND selected.engine_profile='default' AND selected.context_key='fen_only'
+             ORDER BY selected.depth DESC,coalesce(selected.elapsed_ms,0) DESC,selected.rowid DESC LIMIT 1)
            LEFT JOIN deep_results r ON r.task_id=n.analyzed_task_id AND r.multipv=1
            WHERE n.project_id=?1 ORDER BY n.ply,n.id").map_err(|e|e.to_string())?;
         let raw = stmt
@@ -577,7 +589,7 @@ mod tests {
         let summary = reopened.read_project_summary(&p.id).unwrap();
         assert_eq!(summary.name, "Study");
         assert_eq!(summary.root_fen, start_fen());
-        assert_eq!(summary.task_counts.queued, 2);
+        assert_eq!(summary.task_counts.queued, 1);
         assert_eq!(summary.analysed_node_count, 0);
         let tasks = reopened.read_tasks(&p.id).unwrap();
         let priority = tasks.iter().find(|t| t.id == manual.id).unwrap();
@@ -591,7 +603,7 @@ mod tests {
         let scheduler = reopened.read_scheduler(&p.id).unwrap();
         assert!(serde_json::to_value(&scheduler).unwrap()["cycle"].is_string());
         assert_eq!(scheduler.cycle, "0");
-        assert_eq!(scheduler.queue_length, 2);
+        assert_eq!(scheduler.queue_length, 1);
         assert_eq!(scheduler.active_task_id, None);
     }
 }

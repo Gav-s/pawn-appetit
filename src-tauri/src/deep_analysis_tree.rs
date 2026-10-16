@@ -130,7 +130,7 @@ pub(super) fn backfill_legacy(conn: &mut Connection) -> Result<(), String> {
             if lines.is_empty() {
                 return Err("completed task has no scored PV".into());
             }
-            store_completed(&tx, &task_id, &lines)
+            store_completed(&tx, &task_id, &lines, None)
         })();
         match outcome {
             Ok(()) => tx
@@ -271,6 +271,7 @@ pub(super) fn store_completed(
     tx: &Transaction<'_>,
     task_id: &str,
     lines: &[DeepAnalysisLine],
+    elapsed_ms: Option<u64>,
 ) -> Result<(), String> {
     let (project_id, parent_task_id, fen, moves_json, ply, occurrence_id): (
         String,
@@ -419,20 +420,27 @@ pub(super) fn store_completed(
             position_graph::link_node(tx, parent_id)?;
         }
     }
-    recompute_ancestors(tx, root_id)?;
+    if let Some(position_id) =
+        position_graph::record_accepted(tx, task_id, root_id, lines, elapsed_ms)?
+    {
+        position_graph::propagate(tx, position_id)?;
+    } else {
+        recompute_ancestors(tx, root_id)?;
+    }
     Ok(())
 }
 
 // Only scored children participate. The result is provisional while the tree is incomplete.
-fn recompute_ancestors(tx: &Transaction<'_>, start: i64) -> Result<(), String> {
+pub(super) fn recompute_ancestors(tx: &Transaction<'_>, start: i64) -> Result<(), String> {
     let mut next = Some(start);
     while let Some(id) = next {
-        let (parent, fen, direct_kind, direct_value):
-            (Option<i64>, String, Option<String>, Option<i32>) = tx
+        let (parent, fen, position_id, engine, direct_kind, direct_value):
+            (Option<i64>, String, i64, String, Option<String>, Option<i32>) = tx
             .query_row(
-                "SELECT parent_id,fen,direct_score_kind,direct_score_value FROM deep_tree_nodes WHERE id=?1",
+                "SELECT n.parent_id,n.fen,n.position_id,p.engine,n.direct_score_kind,n.direct_score_value
+                 FROM deep_tree_nodes n JOIN deep_projects p ON p.id=n.project_id WHERE n.id=?1",
                 [id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
             )
             .map_err(|e| e.to_string())?;
         let mut statement = tx
@@ -463,7 +471,9 @@ fn recompute_ancestors(tx: &Transaction<'_>, start: i64) -> Result<(), String> {
                 chosen = Some(candidate);
             }
         }
-        let score = chosen.or_else(|| direct_kind.zip(direct_value));
+        let score = chosen
+            .or(position_graph::best_score(tx, position_id, &engine)?)
+            .or_else(|| direct_kind.zip(direct_value));
         tx.execute(
             "UPDATE deep_tree_nodes SET minimax_score_kind=?2,minimax_score_value=?3 WHERE id=?1",
             params![

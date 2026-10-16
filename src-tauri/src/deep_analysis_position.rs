@@ -1,6 +1,6 @@
 //! Project-local canonical positions. Occurrences keep their own histories and minimax values.
-use super::position;
-use rusqlite::{params, Connection, Transaction};
+use super::{position, DeepAnalysisLine};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use shakmaty::{
     fen::Epd,
     zobrist::{Zobrist128, ZobristHash},
@@ -102,7 +102,23 @@ pub(super) fn migrate(conn: &mut Connection) -> Result<(), String> {
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             UNIQUE(project_id,canonical_epd,halfmove_clock)
          );
-         CREATE INDEX IF NOT EXISTS deep_position_lookup ON deep_position_records(project_id,position_key);",
+         CREATE INDEX IF NOT EXISTS deep_position_lookup ON deep_position_records(project_id,position_key);
+         CREATE TABLE IF NOT EXISTS deep_position_evaluations (
+            task_id TEXT PRIMARY KEY REFERENCES deep_tasks(id) ON DELETE CASCADE,
+            position_id INTEGER NOT NULL REFERENCES deep_position_records(id) ON DELETE CASCADE,
+            engine TEXT NOT NULL,
+            engine_profile TEXT NOT NULL,
+            context_key TEXT NOT NULL,
+            multipv INTEGER NOT NULL,
+            depth INTEGER NOT NULL,
+            elapsed_ms INTEGER,
+            score_kind TEXT NOT NULL,
+            score_value INTEGER NOT NULL,
+            pv_json TEXT NOT NULL,
+            accepted_at TEXT NOT NULL DEFAULT (datetime('now'))
+         );
+         CREATE INDEX IF NOT EXISTS deep_position_evaluations_quality
+            ON deep_position_evaluations(position_id,engine,engine_profile,context_key,depth DESC,elapsed_ms DESC);",
     )
     .map_err(|e| e.to_string())?;
     let has_link = tx
@@ -136,9 +152,193 @@ pub(super) fn migrate(conn: &mut Connection) -> Result<(), String> {
     for id in missing {
         link_node(&tx, id)?;
     }
-    tx.execute_batch("PRAGMA user_version=4")
+    tx.execute_batch("PRAGMA user_version=5")
         .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
+}
+
+/// Persist one accepted search on the canonical position. A task with explicit UCI
+/// history remains scoped to that search context; only FEN-only searches are shared.
+pub(super) fn record_accepted(
+    tx: &Transaction<'_>,
+    task_id: &str,
+    node_id: i64,
+    lines: &[DeepAnalysisLine],
+    elapsed_ms: Option<u64>,
+) -> Result<Option<i64>, String> {
+    let best = lines
+        .iter()
+        .min_by_key(|line| line.multipv)
+        .ok_or("empty PV")?;
+    let depth = lines
+        .iter()
+        .map(|line| line.depth)
+        .min()
+        .ok_or("empty PV")?;
+    let (position_id, engine, profile, moves): (i64, String, String, String) = tx
+        .query_row(
+            "SELECT n.position_id,t.execution_engine,t.engine_profile,t.moves
+             FROM deep_tree_nodes n JOIN deep_tasks t ON t.id=?1 WHERE n.id=?2",
+            params![task_id, node_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    let context = if moves == "[]" {
+        "fen_only".to_owned()
+    } else {
+        format!("moves:{moves}")
+    };
+    tx.execute(
+        "INSERT INTO deep_position_evaluations(
+            task_id,position_id,engine,engine_profile,context_key,multipv,depth,elapsed_ms,
+            score_kind,score_value,pv_json)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+         ON CONFLICT(task_id) DO NOTHING",
+        params![
+            task_id,
+            position_id,
+            engine,
+            profile,
+            context,
+            lines.len(),
+            depth,
+            elapsed_ms.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+            best.score_kind,
+            best.score_value,
+            serde_json::to_string(&best.uci_moves).map_err(|e| e.to_string())?
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    log::debug!("Accepted canonical analysis at position {position_id}, task {task_id}");
+    Ok((context == "fen_only").then_some(position_id))
+}
+
+pub(super) fn sufficient_task(
+    tx: &Transaction<'_>,
+    position_id: i64,
+    requested_task_id: &str,
+) -> Result<Option<String>, String> {
+    tx.query_row(
+        "SELECT e.task_id FROM deep_position_evaluations e
+         JOIN deep_tasks accepted ON accepted.id=e.task_id
+         JOIN deep_tasks wanted ON wanted.id=?2
+         WHERE e.position_id=?1 AND accepted.status='completed'
+           AND e.context_key='fen_only' AND e.engine=wanted.execution_engine
+           AND e.engine_profile=wanted.engine_profile
+           AND e.multipv>=wanted.requested_multipv
+           AND e.elapsed_ms>=wanted.requested_time_ms
+           AND e.depth>=wanted.requested_depth AND e.score_kind IN ('cp','mate')
+         ORDER BY e.depth DESC,e.elapsed_ms DESC,e.rowid DESC LIMIT 1",
+        params![position_id, requested_task_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+pub(super) fn best_score(
+    tx: &Transaction<'_>,
+    position_id: i64,
+    engine: &str,
+) -> Result<Option<(String, i32)>, String> {
+    tx.query_row(
+        "SELECT score_kind,score_value FROM deep_position_evaluations
+         WHERE position_id=?1 AND engine=?2 AND engine_profile='default' AND context_key='fen_only'
+         ORDER BY depth DESC,coalesce(elapsed_ms,0) DESC,rowid DESC LIMIT 1",
+        params![position_id, engine],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+/// Existing accepted tasks retain their original rows; attach their known results
+/// without inventing an elapsed search time or changing task and occurrence links.
+pub(super) fn backfill_accepted(conn: &mut Connection) -> Result<(), String> {
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let missing = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT a.task_id,a.node_id FROM deep_tree_analyses a
+             JOIN deep_tasks t ON t.id=a.task_id
+             WHERE t.status='completed' AND NOT EXISTS(
+                SELECT 1 FROM deep_position_evaluations e WHERE e.task_id=a.task_id)
+             ORDER BY t.rowid",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        rows
+    };
+    let mut affected = std::collections::BTreeSet::new();
+    for (task_id, node_id) in missing {
+        let lines = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT multipv,depth,score_kind,score_value,score_perspective,uci_moves
+                FROM deep_results WHERE task_id=?1 ORDER BY multipv",
+                )
+                .map_err(|e| e.to_string())?;
+            let raw = stmt
+                .query_map([&task_id], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            raw.into_iter()
+                .map(
+                    |(multipv, depth, score_kind, score_value, score_perspective, moves)| {
+                        Ok(DeepAnalysisLine {
+                            multipv,
+                            depth,
+                            score_kind,
+                            score_value,
+                            score_perspective,
+                            uci_moves: serde_json::from_str(&moves).map_err(|e| e.to_string())?,
+                        })
+                    },
+                )
+                .collect::<Result<Vec<_>, String>>()?
+        };
+        if !lines.is_empty() {
+            if let Some(position_id) = record_accepted(&tx, &task_id, node_id, &lines, None)? {
+                affected.insert(position_id);
+            }
+        }
+    }
+    for position_id in affected {
+        propagate(&tx, position_id)?;
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
+
+pub(super) fn propagate(tx: &Transaction<'_>, position_id: i64) -> Result<(), String> {
+    let ids = {
+        let mut stmt = tx
+            .prepare("SELECT id FROM deep_tree_nodes WHERE position_id=?1 ORDER BY ply DESC,id")
+            .map_err(|e| e.to_string())?;
+        let ids = stmt
+            .query_map([position_id], |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        ids
+    };
+    for id in ids {
+        super::tree::recompute_ancestors(tx, id)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

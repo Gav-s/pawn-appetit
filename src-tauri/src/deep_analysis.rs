@@ -1,6 +1,6 @@
 //! Persistent, independent UCI analysis queue. This does not share interactive engine processes.
 use crate::chess::{EngineOption, EngineOptions, EngineProcess, GoMode};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use scheduler::{AnalysisOperation, Completion};
 use serde::{Deserialize, Serialize};
 use shakmaty::{fen::Fen, uci::UciMove, CastlingMode, Chess, Color, EnPassantMode, Position};
@@ -295,6 +295,8 @@ impl Store {
         position_graph::migrate(&mut conn)?;
         tree::backfill_legacy(&mut conn)?;
         read::restore_missing_roots(&mut conn)?;
+        position_graph::backfill_accepted(&mut conn)?;
+        task_spec::migrate_graph(&mut conn)?;
         Ok(store)
     }
     fn conn(&self) -> Result<Connection, String> {
@@ -527,7 +529,14 @@ impl Store {
             params![task_id, id, normalized, serde_json::to_string(moves).map_err(|e| e.to_string())?, moves.len() as u32]).map_err(|e| e.to_string())?;
         tx.execute("INSERT INTO deep_tree_nodes(project_id,source_task_id,fen,history,ply) VALUES(?1,?2,?3,?4,?5)",
             params![id,task_id,root_fen,serde_json::to_string(moves).map_err(|e|e.to_string())?,moves.len() as u32]).map_err(|e|e.to_string())?;
-        position_graph::link_node(&tx, tx.last_insert_rowid())?;
+        let root_id = tx.last_insert_rowid();
+        let position_id = position_graph::link_node(&tx, root_id)?;
+        tx.execute(
+            "UPDATE deep_tasks SET position_id=?2 WHERE id=?1",
+            params![task_id, position_id],
+        )
+        .map_err(|e| e.to_string())?;
+        task_spec::add_interest(&tx, &task_id, root_id, "Root", 0, 0)?;
         tx.commit().map_err(|e| e.to_string())?;
         self.get_project(&id)?
             .ok_or_else(|| "project not found".into())
@@ -650,39 +659,120 @@ impl Store {
             None
         };
         let id = uuid::Uuid::new_v4().to_string();
-        if self
-            .conn()?
-            .execute(
-                "INSERT INTO deep_tasks(id,project_id,parent_task_id,fen,moves,ply,occurrence_id,priority)
-            SELECT ?1,?2,?3,?4,?5,?6,?7,?8 WHERE EXISTS (
-                SELECT 1 FROM deep_projects WHERE id=?2 AND status!='cancelled' AND (?8=1 OR status='running')
-            )",
-                params![
-                    id,
-                    project_id,
-                    parent_task_id,
-                    normalized,
-                    "[]",
-                    ply,
-                    resolved_occurrence,
-                    if automatic {0} else {1},
-                ],
+        let mut conn = self.conn()?;
+        // Serialize competing queue insertions before checking for a compatible search.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let position_id: i64 = if let Some(node_id) = resolved_occurrence {
+            tx.query_row(
+                "SELECT position_id FROM deep_tree_nodes WHERE id=?1 AND project_id=?2 AND fen=?3",
+                params![node_id, project_id, normalized],
+                |r| r.get(0),
             )
             .map_err(|e| e.to_string())?
-            == 0
-        {
+        } else {
+            position_graph::get_or_create(&tx, project_id, &normalized)?
+        };
+        let priority = if automatic { 0 } else { 1 };
+        // The existing insert trigger captures the current immutable search settings.
+        // Keep the candidate unlinked until its snapshot can be compared to queued work.
+        if tx.execute(
+            "INSERT INTO deep_tasks(id,project_id,parent_task_id,fen,moves,ply,occurrence_id,priority)
+             SELECT ?1,?2,?3,?4,'[]',?5,?6,?7 WHERE EXISTS (
+                SELECT 1 FROM deep_projects WHERE id=?2 AND status!='cancelled' AND (?7=1 OR status='running'))",
+            params![id,project_id,parent_task_id,normalized,ply,resolved_occurrence,priority],
+        ).map_err(|e|e.to_string())? == 0 {
             return Err("cancelled project cannot accept tasks".into());
         }
-        Ok(DeepAnalysisTask {
-            id,
-            project_id: project_id.into(),
-            parent_task_id: parent_task_id.map(str::to_owned),
-            fen: normalized,
-            moves: vec![],
-            ply,
-            status: "queued".into(),
-            error: None,
-        })
+        let equivalent: Option<String> = tx
+            .query_row(
+                "SELECT existing.id FROM deep_tasks existing JOIN deep_tasks wanted ON wanted.id=?1
+             WHERE existing.id!=wanted.id AND existing.project_id=wanted.project_id
+               AND existing.position_id=?2 AND existing.status IN ('queued','running')
+               AND existing.execution_engine=wanted.execution_engine
+               AND existing.engine_profile=wanted.engine_profile
+               AND existing.cache_policy=wanted.cache_policy
+               AND existing.requested_multipv>=wanted.requested_multipv
+               AND existing.requested_time_ms>=wanted.requested_time_ms
+               AND existing.requested_depth>=wanted.requested_depth
+               AND existing.operation_mode=wanted.operation_mode
+             ORDER BY CASE existing.status WHEN 'running' THEN 0 ELSE 1 END,
+               existing.priority DESC,existing.rowid LIMIT 1",
+                params![id, position_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let actual_id = if let Some(existing) = equivalent {
+            tx.execute("DELETE FROM deep_tasks WHERE id=?1", [&id])
+                .map_err(|e| e.to_string())?;
+            tx.execute(
+                "UPDATE deep_tasks SET priority=MAX(priority,?2) WHERE id=?1",
+                params![existing, priority],
+            )
+            .map_err(|e| e.to_string())?;
+            log::debug!(
+                "Coalesced canonical task request for position {position_id} into {existing}"
+            );
+            existing
+        } else if let Some(accepted) = position_graph::sufficient_task(&tx, position_id, &id)? {
+            tx.execute("DELETE FROM deep_tasks WHERE id=?1", [&id])
+                .map_err(|e| e.to_string())?;
+            log::debug!("Reused accepted canonical analysis {accepted} at position {position_id}");
+            accepted
+        } else if let Some(weaker) = tx
+            .query_row(
+                "SELECT existing.id FROM deep_tasks existing JOIN deep_tasks wanted ON wanted.id=?1
+             WHERE existing.id!=wanted.id AND existing.project_id=wanted.project_id
+               AND existing.position_id=?2 AND existing.status='queued'
+               AND existing.execution_engine=wanted.execution_engine
+               AND existing.engine_profile=wanted.engine_profile
+               AND existing.cache_policy=wanted.cache_policy
+               AND existing.operation_mode=wanted.operation_mode
+             ORDER BY existing.priority DESC,existing.rowid LIMIT 1",
+                params![id, position_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+        {
+            tx.execute("UPDATE deep_tasks SET
+                requested_multipv=MAX(requested_multipv,(SELECT requested_multipv FROM deep_tasks WHERE id=?2)),
+                requested_time_ms=MAX(requested_time_ms,(SELECT requested_time_ms FROM deep_tasks WHERE id=?2)),
+                requested_depth=MAX(requested_depth,(SELECT requested_depth FROM deep_tasks WHERE id=?2)),
+                priority=MAX(priority,?3) WHERE id=?1",
+                params![weaker,id,priority]).map_err(|e|e.to_string())?;
+            tx.execute("DELETE FROM deep_tasks WHERE id=?1", [&id])
+                .map_err(|e| e.to_string())?;
+            log::debug!(
+                "Strengthened pending canonical search {weaker} for position {position_id}"
+            );
+            weaker
+        } else {
+            tx.execute(
+                "UPDATE deep_tasks SET position_id=?2 WHERE id=?1",
+                params![id, position_id],
+            )
+            .map_err(|e| e.to_string())?;
+            log::debug!("Queued new canonical search for position {position_id}, task {id}");
+            id
+        };
+        if let Some(node_id) = resolved_occurrence {
+            task_spec::add_interest(
+                &tx,
+                &actual_id,
+                node_id,
+                if automatic { "Automatic" } else { "Manual" },
+                priority,
+                0,
+            )?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        self.list_tasks(project_id)?
+            .into_iter()
+            .find(|task| task.id == actual_id)
+            .ok_or_else(|| "queued task disappeared".into())
     }
     fn manual_prolong(
         &self,
@@ -1033,7 +1123,7 @@ impl Store {
         for line in lines {
             tx.execute("INSERT INTO deep_results(task_id,multipv,depth,score_kind,score_value,score_perspective,uci_moves) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![task_id,line.multipv,line.depth,line.score_kind,line.score_value,line.score_perspective,serde_json::to_string(&line.uci_moves).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
         }
-        tree::store_completed(&tx, task_id, lines)?;
+        tree::store_completed(&tx, task_id, lines, quality.map(|(elapsed, _)| elapsed))?;
         if let (Some((elapsed, engine)), Some(key)) = (quality, cache_key) {
             let depth = lines
                 .iter()
@@ -1979,6 +2069,15 @@ pub fn show_debug_analysis(db: &Path, id: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn independent_root_fen() -> String {
+        Fen::from_position(
+            position_after(&start_fen(), &["d2d4".into()]).unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string()
+    }
+
     #[test]
     fn analysis_store_uses_wal_for_concurrent_ui_reads_and_worker_writes() {
         let dir = tempfile::tempdir().unwrap();
@@ -2508,10 +2607,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!((total, linked), (3, 3));
+        let (target, root_position): (Option<i64>, i64) = conn
+            .query_row(
+                "SELECT t.position_id,n.position_id FROM deep_tasks t JOIN deep_tree_nodes n
+             ON n.source_task_id=t.id AND n.parent_id IS NULL WHERE t.id=?1",
+                [&task.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(target, Some(root_position));
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM deep_task_interests WHERE task_id=?1",
+                [&task.id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
         assert_eq!(
             conn.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
                 .unwrap(),
-            4
+            6
         );
     }
 
@@ -2547,7 +2664,7 @@ mod tests {
                 .unwrap()
                 .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
                 .unwrap(),
-            4
+            6
         );
     }
 
@@ -2719,7 +2836,11 @@ mod tests {
                 &[],
             )
             .unwrap();
-        let _next = s.queue_root(&p.id, "startpos", 0).unwrap();
+        let next = s.queue_root(&p.id, &independent_root_fen(), 1).unwrap();
+        s.conn()
+            .unwrap()
+            .execute("UPDATE deep_tasks SET priority=0 WHERE id=?1", [&next.id])
+            .unwrap();
         let settings = scheduler::AnalysisSettings::default();
         s.enable_automatic(&p.id, &settings).unwrap();
         s.begin_running(&p.id, "paused").unwrap();
@@ -2789,7 +2910,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-        let _next = s.queue_root(&p.id, "startpos", 0).unwrap();
+        let _next = s.queue_root(&p.id, &independent_root_fen(), 1).unwrap();
         s.begin_running(&p.id, "paused").unwrap();
         let task = s.claim(&p.id).unwrap().unwrap();
         let state = DeepAnalysisState::default();
@@ -2921,7 +3042,7 @@ mod tests {
         let first = s.list_tasks(&p.id).unwrap().remove(0);
         s.set_status(&p.id, "running").unwrap();
         assert_eq!(s.claim(&p.id).unwrap().unwrap().id, first.id);
-        let second = s.queue_root(&p.id, "startpos", 0).unwrap();
+        let second = s.queue_root(&p.id, &independent_root_fen(), 1).unwrap();
         s.save(
             &first.id,
             &[DeepAnalysisLine {
@@ -3082,7 +3203,11 @@ mod tests {
                 &[],
             )
             .unwrap();
-        s.queue_root(&p.id, "startpos", 0).unwrap();
+        let next = s.queue_root(&p.id, &independent_root_fen(), 1).unwrap();
+        s.conn()
+            .unwrap()
+            .execute("UPDATE deep_tasks SET priority=0 WHERE id=?1", [&next.id])
+            .unwrap();
         s.begin_running(&p.id, "paused").unwrap();
         let current = s.claim(&p.id).unwrap().unwrap();
         let state = DeepAnalysisState::default();
@@ -3154,7 +3279,11 @@ mod tests {
                 &[],
             )
             .unwrap();
-        s.queue_root(&p.id, "startpos", 0).unwrap();
+        let next = s.queue_root(&p.id, &independent_root_fen(), 1).unwrap();
+        s.conn()
+            .unwrap()
+            .execute("UPDATE deep_tasks SET priority=0 WHERE id=?1", [&next.id])
+            .unwrap();
         s.begin_running(&p.id, "paused").unwrap();
         let task = s.claim(&p.id).unwrap().unwrap();
         let other = Store::open(&path).unwrap();
@@ -3969,6 +4098,545 @@ mod tests {
         assert_eq!(e4, (20, 5));
         assert_eq!(root_score, 5);
     }
+    #[test]
+    fn accepted_position_score_updates_both_transposed_paths_and_their_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("shared.sqlite")).unwrap();
+        let project = store
+            .create_project(
+                "shared",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                100,
+                2,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        store.begin_running(&project.id, "paused").unwrap();
+        let root = store.claim(&project.id).unwrap().unwrap();
+        let paths = ["g1f3 g8f6 b1c3 b8c6", "b1c3 b8c6 g1f3 g8f6"];
+        let lines = paths
+            .iter()
+            .enumerate()
+            .map(|(index, moves)| {
+                parse_line(
+                    &format!("info depth 8 multipv {} score cp 20 pv {moves}", index + 1),
+                    &root.fen,
+                    &[],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        store.save(&root.id, &lines).unwrap();
+        let histories: Vec<Vec<String>> = paths
+            .iter()
+            .map(|path| path.split_whitespace().map(str::to_owned).collect())
+            .collect();
+        let conn = store.conn().unwrap();
+        let leaves: Vec<i64> = histories
+            .iter()
+            .map(|history| {
+                conn.query_row(
+                    "SELECT id FROM deep_tree_nodes WHERE project_id=?1 AND history=?2",
+                    params![project.id, serde_json::to_string(history).unwrap()],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            })
+            .collect();
+        let shared_position: i64 = conn
+            .query_row(
+                "SELECT position_id FROM deep_tree_nodes WHERE id=?1",
+                [leaves[0]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            shared_position,
+            conn.query_row(
+                "SELECT position_id FROM deep_tree_nodes WHERE id=?1",
+                [leaves[1]],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap()
+        );
+        drop(conn);
+        let fen = Fen::from_position(
+            position_after(&root.fen, &histories[0]).unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let task = store
+            .queue_at_occurrence(&project.id, &root.id, &fen, 4, leaves[0])
+            .unwrap();
+        store.claim(&project.id).unwrap();
+        store
+            .save(
+                &task.id,
+                &[parse_line("info depth 12 score cp 37 pv e2e4", &fen, &[]).unwrap()],
+            )
+            .unwrap();
+        let views = store.read_tree(&project.id).unwrap();
+        assert_eq!(
+            store
+                .read_project_summary(&project.id)
+                .unwrap()
+                .analysed_node_count,
+            3
+        );
+        let conn = store.conn().unwrap();
+        for leaf in leaves {
+            let view = views
+                .iter()
+                .find(|node| node.id == leaf.to_string())
+                .unwrap();
+            assert_eq!(
+                view.raw_evaluation,
+                read::EvaluationView::Centipawns {
+                    value: 37,
+                    display: "+0.37".into()
+                }
+            );
+            assert_eq!(
+                view.minimax_evaluation,
+                read::EvaluationView::Centipawns {
+                    value: 37,
+                    display: "+0.37".into()
+                }
+            );
+            let parent_minimax: Option<i32> = conn
+                .query_row(
+                    "SELECT p.minimax_score_value FROM deep_tree_nodes n
+                 JOIN deep_tree_nodes p ON p.id=n.parent_id WHERE n.id=?1",
+                    [leaf],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(parent_minimax, Some(37));
+        }
+    }
+
+    #[test]
+    fn equivalent_pending_transposed_requests_share_one_task_and_retain_both_interests() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("coalesced.sqlite")).unwrap();
+        let project = store
+            .create_project(
+                "coalesce",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                100,
+                2,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        store.begin_running(&project.id, "paused").unwrap();
+        let root = store.claim(&project.id).unwrap().unwrap();
+        let paths = ["g1f3 g8f6 b1c3 b8c6", "b1c3 b8c6 g1f3 g8f6"];
+        let lines: Vec<_> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                parse_line(
+                    &format!("info depth 8 multipv {} score cp 20 pv {path}", i + 1),
+                    &root.fen,
+                    &[],
+                )
+                .unwrap()
+            })
+            .collect();
+        store.save(&root.id, &lines).unwrap();
+        let conn = store.conn().unwrap();
+        let ids: Vec<i64> = paths
+            .iter()
+            .map(|path| {
+                conn.query_row(
+                    "SELECT id FROM deep_tree_nodes WHERE project_id=?1 AND history=?2",
+                    params![
+                        project.id,
+                        serde_json::to_string(&path.split_whitespace().collect::<Vec<_>>())
+                            .unwrap()
+                    ],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            })
+            .collect();
+        drop(conn);
+        let fen = Fen::from_position(
+            position_after(
+                &root.fen,
+                &paths[0]
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let first = store
+            .queue_at_occurrence(&project.id, &root.id, &fen, 4, ids[0])
+            .unwrap();
+        let second = store
+            .queue_at_occurrence(&project.id, &root.id, &fen, 4, ids[1])
+            .unwrap();
+        assert_eq!(first.id, second.id);
+        let conn = store.conn().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM deep_tasks WHERE project_id=?1 AND status='queued'",
+                [&project.id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        let interests: Vec<i64> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT node_id FROM deep_task_interests WHERE task_id=?1 ORDER BY node_id",
+                )
+                .unwrap();
+            stmt.query_map([&first.id], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(interests, ids);
+    }
+
+    #[test]
+    fn stronger_pending_transposed_request_upgrades_search_without_mutating_older_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("stronger.sqlite")).unwrap();
+        let project = store
+            .create_project(
+                "upgrade",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                100,
+                2,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        store.begin_running(&project.id, "paused").unwrap();
+        let root = store.claim(&project.id).unwrap().unwrap();
+        let paths = ["g1f3 g8f6 b1c3 b8c6", "b1c3 b8c6 g1f3 g8f6"];
+        store
+            .save(
+                &root.id,
+                &paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        parse_line(
+                            &format!("info depth 8 multipv {} score cp 20 pv {p}", i + 1),
+                            &root.fen,
+                            &[],
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let conn = store.conn().unwrap();
+        let ids: Vec<i64> = paths
+            .iter()
+            .map(|p| {
+                conn.query_row(
+                    "SELECT id FROM deep_tree_nodes WHERE project_id=?1 AND history=?2",
+                    params![
+                        project.id,
+                        serde_json::to_string(&p.split_whitespace().collect::<Vec<_>>()).unwrap()
+                    ],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            })
+            .collect();
+        drop(conn);
+        let fen = Fen::from_position(
+            position_after(
+                &root.fen,
+                &paths[0]
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let mut settings = scheduler::AnalysisSettings {
+            analysis_time_ms: 100,
+            analysis_depth: 8,
+            engine_id: project.engine.clone(),
+            ..Default::default()
+        };
+        store.enable_automatic(&project.id, &settings).unwrap();
+        let first = store
+            .queue_at_occurrence(&project.id, &root.id, &fen, 4, ids[0])
+            .unwrap();
+        let initial = store.task_execution(&first.id).unwrap();
+        assert_eq!((initial.time_ms, initial.depth), (100, 8));
+        settings.analysis_time_ms = 250;
+        settings.analysis_depth = 14;
+        store.enable_automatic(&project.id, &settings).unwrap();
+        let second = store
+            .queue_at_occurrence(&project.id, &root.id, &fen, 4, ids[1])
+            .unwrap();
+        assert_eq!(first.id, second.id);
+        let upgraded = store.task_execution(&first.id).unwrap();
+        assert_eq!((upgraded.time_ms, upgraded.depth), (250, 14));
+        assert_eq!(
+            store
+                .list_tasks(&project.id)
+                .unwrap()
+                .iter()
+                .filter(|t| t.status == "queued")
+                .count(),
+            1
+        );
+        assert_eq!(
+            store
+                .conn()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM deep_task_interests WHERE task_id=?1",
+                    [&first.id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn accepted_quality_reuses_one_position_search_without_queueing_a_second_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("reused.sqlite")).unwrap();
+        let project = store
+            .create_project(
+                "reuse",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                100,
+                2,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        store.begin_running(&project.id, "paused").unwrap();
+        let root = store.claim(&project.id).unwrap().unwrap();
+        let paths = ["g1f3 g8f6 b1c3 b8c6", "b1c3 b8c6 g1f3 g8f6"];
+        store
+            .save(
+                &root.id,
+                &paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        parse_line(
+                            &format!("info depth 8 multipv {} score cp 20 pv {p}", i + 1),
+                            &root.fen,
+                            &[],
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let conn = store.conn().unwrap();
+        let ids: Vec<i64> = paths
+            .iter()
+            .map(|p| {
+                conn.query_row(
+                    "SELECT id FROM deep_tree_nodes WHERE project_id=?1 AND history=?2",
+                    params![
+                        project.id,
+                        serde_json::to_string(&p.split_whitespace().collect::<Vec<_>>()).unwrap()
+                    ],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            })
+            .collect();
+        drop(conn);
+        let fen = Fen::from_position(
+            position_after(
+                &root.fen,
+                &paths[0]
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let first = store
+            .queue_at_occurrence(&project.id, &root.id, &fen, 4, ids[0])
+            .unwrap();
+        store.claim(&project.id).unwrap();
+        let lines = [
+            parse_line("info depth 16 multipv 1 score cp 51 pv e2e4", &fen, &[]).unwrap(),
+            parse_line("info depth 16 multipv 2 score cp 42 pv d2d4", &fen, &[]).unwrap(),
+        ];
+        store
+            .save_cached(&first.id, &lines, 200, &project.engine)
+            .unwrap();
+        let reused = store
+            .queue_at_occurrence(&project.id, &root.id, &fen, 4, ids[1])
+            .unwrap();
+        assert_eq!(reused.id, first.id);
+        assert_eq!(reused.status, "completed");
+        assert_eq!(store.list_tasks(&project.id).unwrap().len(), 2);
+        assert_eq!(
+            store
+                .conn()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM deep_task_interests WHERE task_id=?1",
+                    [&first.id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+        let views = store.read_tree(&project.id).unwrap();
+        for id in ids {
+            assert_eq!(
+                views
+                    .iter()
+                    .find(|n| n.id == id.to_string())
+                    .unwrap()
+                    .raw_evaluation,
+                read::EvaluationView::Centipawns {
+                    value: 51,
+                    display: "+0.51".into()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn running_position_search_accepts_a_second_path_and_finishes_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("running-share.sqlite")).unwrap();
+        let project = store
+            .create_project(
+                "running",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                100,
+                2,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        store.begin_running(&project.id, "paused").unwrap();
+        let root = store.claim(&project.id).unwrap().unwrap();
+        let paths = ["g1f3 g8f6 b1c3 b8c6", "b1c3 b8c6 g1f3 g8f6"];
+        store
+            .save(
+                &root.id,
+                &paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        parse_line(
+                            &format!("info depth 8 multipv {} score cp 20 pv {p}", i + 1),
+                            &root.fen,
+                            &[],
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let conn = store.conn().unwrap();
+        let ids: Vec<i64> = paths
+            .iter()
+            .map(|p| {
+                conn.query_row(
+                    "SELECT id FROM deep_tree_nodes WHERE project_id=?1 AND history=?2",
+                    params![
+                        project.id,
+                        serde_json::to_string(&p.split_whitespace().collect::<Vec<_>>()).unwrap()
+                    ],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            })
+            .collect();
+        drop(conn);
+        let fen = Fen::from_position(
+            position_after(
+                &root.fen,
+                &paths[0]
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let first = store
+            .queue_at_occurrence(&project.id, &root.id, &fen, 4, ids[0])
+            .unwrap();
+        assert_eq!(store.claim(&project.id).unwrap().unwrap().id, first.id);
+        let second = store
+            .queue_at_occurrence(&project.id, &root.id, &fen, 4, ids[1])
+            .unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.status, "running");
+        assert_eq!(store.list_tasks(&project.id).unwrap().len(), 2);
+        store
+            .save(
+                &first.id,
+                &[parse_line("info depth 12 score mate 3 pv e2e4", &fen, &[]).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .conn()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM deep_position_evaluations WHERE task_id=?1",
+                    [&first.id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .conn()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM deep_task_interests WHERE task_id=?1",
+                    [&first.id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+        let views = store.read_tree(&project.id).unwrap();
+        for id in ids {
+            assert_eq!(
+                views
+                    .iter()
+                    .find(|n| n.id == id.to_string())
+                    .unwrap()
+                    .raw_evaluation,
+                read::EvaluationView::Mate {
+                    distance: 3,
+                    display: "M+3".into()
+                }
+            );
+        }
+    }
+
     #[test]
     fn transposed_pvs_need_an_exact_occurrence_to_queue_a_continuation() {
         let dir = tempfile::tempdir().unwrap();
