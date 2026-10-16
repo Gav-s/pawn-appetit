@@ -282,6 +282,147 @@ mod graph_tests {
     }
 
     #[test]
+    fn shared_score_updates_independent_black_ancestors_and_mate_without_merging_paths() {
+        use crate::deep_analysis::{parse_line, read::EvaluationView};
+        use rusqlite::params;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("independent-minimax.sqlite")).unwrap();
+        let project = store
+            .create_project(
+                "independent",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                100,
+                4,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        store.begin_running(&project.id, "paused").unwrap();
+        let root = store.claim(&project.id).unwrap().unwrap();
+        let paths = [
+            "g1f3 g8f6 b1c3 b8c6",
+            "b1c3 b8c6 g1f3 g8f6",
+            "g1f3 g8f6 b1c3 e7e5",
+            "b1c3 b8c6 g1f3 e7e5",
+        ];
+        let lines = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                parse_line(
+                    &format!("info depth 12 multipv {} score cp 0 pv {p}", i + 1),
+                    &root.fen,
+                    &[],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        store.save(&root.id, &lines).unwrap();
+        let conn = store.conn().unwrap();
+        let ids: Vec<i64> = paths
+            .iter()
+            .map(|p| {
+                conn.query_row(
+                    "SELECT id FROM deep_tree_nodes WHERE project_id=?1 AND history=?2",
+                    params![
+                        project.id,
+                        serde_json::to_string(&p.split_whitespace().collect::<Vec<_>>()).unwrap()
+                    ],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            })
+            .collect();
+        let parents: Vec<i64> = ids[..2]
+            .iter()
+            .map(|id| {
+                conn.query_row(
+                    "SELECT parent_id FROM deep_tree_nodes WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_ne!(ids[0], ids[1]);
+        assert_ne!(parents[0], parents[1]);
+        drop(conn);
+        let score_path = |node: i64, engine_score: i32, depth: u32, mate: bool| {
+            let conn = store.conn().unwrap();
+            let fen: String = conn
+                .query_row("SELECT fen FROM deep_tree_nodes WHERE id=?1", [node], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            drop(conn);
+            let task = store
+                .queue_at_occurrence(&project.id, &root.id, &fen, 4, node)
+                .unwrap();
+            assert_eq!(store.claim(&project.id).unwrap().unwrap().id, task.id);
+            let score = if mate {
+                format!("mate {engine_score}")
+            } else {
+                format!("cp {engine_score}")
+            };
+            let line = parse_line(
+                &format!("info depth {depth} score {score} pv e2e4"),
+                &fen,
+                &[],
+            )
+            .unwrap();
+            store.save(&task.id, &[line]).unwrap();
+        };
+        score_path(ids[0], 20, 12, false);
+        score_path(ids[2], -50, 12, false);
+        score_path(ids[3], 50, 12, false);
+        let ancestor_values = || {
+            parents
+                .iter()
+                .map(|p| {
+                    store
+                        .conn()
+                        .unwrap()
+                        .query_row(
+                            "SELECT minimax_score_value FROM deep_tree_nodes WHERE id=?1",
+                            [p],
+                            |r| r.get::<_, i32>(0),
+                        )
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ancestor_values(), vec![-50, 20]);
+        score_path(ids[1], 40, 20, false);
+        assert_eq!(ancestor_values(), vec![-50, 40]);
+        score_path(ids[1], 3, 24, true);
+        assert_eq!(ancestor_values(), vec![-50, 50]);
+        let views = store.read_tree(&project.id).unwrap();
+        for id in &ids[..2] {
+            assert_eq!(
+                views
+                    .iter()
+                    .find(|n| n.id == id.to_string())
+                    .unwrap()
+                    .raw_evaluation,
+                EvaluationView::Mate {
+                    distance: 3,
+                    display: "M+3".into()
+                }
+            );
+        }
+        let root_score: i32 = store
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT minimax_score_value FROM deep_tree_nodes WHERE analyzed_task_id=?1",
+                [&root.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(root_score, 50);
+    }
+
+    #[test]
     fn shared_completed_search_materializes_legal_pv_under_every_interested_path() {
         use crate::deep_analysis::parse_line;
         use rusqlite::params;
