@@ -18,6 +18,8 @@ use tauri::{path::BaseDirectory, Manager};
 use tauri_specta::Event;
 use vampirc_uci::{parse_one, uci::ScoreValue, UciInfoAttribute, UciMessage};
 
+#[path = "deep_analysis_position.rs"]
+mod position_graph;
 #[path = "deep_analysis_read.rs"]
 mod read;
 #[path = "deep_analysis_scheduler.rs"]
@@ -289,9 +291,10 @@ impl Store {
                 conn.execute_batch(migration).map_err(|e| e.to_string())?;
             }
         }
+        task_spec::migrate(&mut conn)?;
+        position_graph::migrate(&mut conn)?;
         tree::backfill_legacy(&mut conn)?;
         read::restore_missing_roots(&mut conn)?;
-        task_spec::migrate(&mut conn)?;
         Ok(store)
     }
     fn conn(&self) -> Result<Connection, String> {
@@ -524,6 +527,7 @@ impl Store {
             params![task_id, id, normalized, serde_json::to_string(moves).map_err(|e| e.to_string())?, moves.len() as u32]).map_err(|e| e.to_string())?;
         tx.execute("INSERT INTO deep_tree_nodes(project_id,source_task_id,fen,history,ply) VALUES(?1,?2,?3,?4,?5)",
             params![id,task_id,root_fen,serde_json::to_string(moves).map_err(|e|e.to_string())?,moves.len() as u32]).map_err(|e|e.to_string())?;
+        position_graph::link_node(&tx, tx.last_insert_rowid())?;
         tx.commit().map_err(|e| e.to_string())?;
         self.get_project(&id)?
             .ok_or_else(|| "project not found".into())
@@ -2375,6 +2379,143 @@ mod tests {
         assert_eq!(store.list_tasks(&project.id).unwrap()[0].id, task.id);
     }
     #[test]
+    fn existing_transposed_paths_gain_one_project_local_position_without_losing_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transpositions.sqlite");
+        let store = Store::open(&path).unwrap();
+        let project = store
+            .create_project(
+                "Two paths",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                100,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        let task = store.list_tasks(&project.id).unwrap().remove(0);
+        let mut conn = store.conn().unwrap();
+        let tx = conn.transaction().unwrap();
+        let root: i64 = tx
+            .query_row(
+                "SELECT id FROM deep_tree_nodes WHERE source_task_id=?1 AND parent_id IS NULL",
+                [&task.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut leaves = Vec::new();
+        for order in [
+            ["g1f3", "g8f6", "b1c3", "b8c6"],
+            ["b1c3", "b8c6", "g1f3", "g8f6"],
+        ] {
+            let mut history = Vec::new();
+            let mut parent = root;
+            for mv in order {
+                history.push(mv.to_string());
+                let board = position_after(&start_fen(), &history).unwrap();
+                let fen = Fen::from_position(board, EnPassantMode::Legal).to_string();
+                tx.execute(
+                    "INSERT INTO deep_tree_nodes(project_id,source_task_id,parent_id,move_uci,fen,history,ply)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![project.id, task.id, parent, mv, fen,
+                        serde_json::to_string(&history).unwrap(), history.len()],
+                )
+                .unwrap();
+                parent = tx.last_insert_rowid();
+            }
+            leaves.push(parent);
+        }
+        tx.commit().unwrap();
+        assert_ne!(leaves[0], leaves[1]);
+        drop(conn);
+        drop(store);
+
+        for _ in 0..2 {
+            let reopened = Store::open(&path).unwrap();
+            let conn = reopened.conn().unwrap();
+            let (first, second): (i64, i64) = (
+                conn.query_row(
+                    "SELECT position_id FROM deep_tree_nodes WHERE id=?1",
+                    [leaves[0]],
+                    |r| r.get(0),
+                )
+                .unwrap(),
+                conn.query_row(
+                    "SELECT position_id FROM deep_tree_nodes WHERE id=?1",
+                    [leaves[1]],
+                    |r| r.get(0),
+                )
+                .unwrap(),
+            );
+            assert_eq!(first, second);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM deep_tree_nodes WHERE project_id=?1",
+                    [&project.id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                9
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM deep_position_records WHERE project_id=?1",
+                    [&project.id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                8
+            );
+            assert_eq!(
+                conn.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
+            );
+            assert_eq!(reopened.list_tasks(&project.id).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn newly_created_root_and_pv_nodes_have_canonical_positions_before_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fresh.sqlite")).unwrap();
+        let project = store
+            .create_project(
+                "Fresh positions",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                100,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        let task = store.list_tasks(&project.id).unwrap().remove(0);
+        store.begin_running(&project.id, "paused").unwrap();
+        store.claim(&project.id).unwrap();
+        let line = parse_line(
+            "info depth 8 score cp 23 pv e2e4 e7e5",
+            &task.fen,
+            &task.moves,
+        )
+        .unwrap();
+        store.save(&task.id, &[line]).unwrap();
+        let conn = store.conn().unwrap();
+        let (total, linked): (i64, i64) = conn
+            .query_row(
+                "SELECT count(*),count(position_id) FROM deep_tree_nodes WHERE project_id=?1",
+                [&project.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((total, linked), (3, 3));
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
+                .unwrap(),
+            4
+        );
+    }
+
+    #[test]
     fn legacy_pending_task_migrates_execution_requirements_once_without_losing_queue() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.sqlite");
@@ -2406,7 +2547,7 @@ mod tests {
                 .unwrap()
                 .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
                 .unwrap(),
-            3
+            4
         );
     }
 

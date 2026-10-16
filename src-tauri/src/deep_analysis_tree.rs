@@ -1,6 +1,6 @@
 //! Persistent move occurrences for IDeA. Every node keeps its actual path; a repeated
 //! board is not merged with another history (threefold repetition depends on the path).
-use super::{position_after, score::AnalysisScore, DeepAnalysisLine};
+use super::{position_after, position_graph, score::AnalysisScore, DeepAnalysisLine};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use shakmaty::{fen::Fen, uci::UciMove, EnPassantMode, Position};
 
@@ -334,6 +334,7 @@ pub(super) fn store_completed(
             .map_err(|e| e.to_string())?
         }
     };
+    position_graph::link_node(tx, root_id)?;
     if tx.execute(
         "UPDATE deep_tasks SET occurrence_id=?2 WHERE id=?1 AND (occurrence_id IS NULL OR occurrence_id=?2)",
         params![task_id, root_id],
@@ -415,6 +416,7 @@ pub(super) fn store_completed(
                     |row| row.get(0),
                 )
                 .map_err(|e| e.to_string())?;
+            position_graph::link_node(tx, parent_id)?;
         }
     }
     recompute_ancestors(tx, root_id)?;

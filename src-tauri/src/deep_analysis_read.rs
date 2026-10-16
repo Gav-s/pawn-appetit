@@ -1,5 +1,5 @@
 //! Stable UI read contracts, built from persisted analysis state (never SQLite rows on the wire).
-use super::{position, position_after, score::AnalysisScore, Store};
+use super::{position, position_after, position_graph, score::AnalysisScore, Store};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use shakmaty::{fen::Fen, san::SanPlus, uci::UciMove, EnPassantMode, Position};
@@ -362,6 +362,7 @@ pub(super) fn restore_missing_roots(conn: &mut Connection) -> Result<(), String>
             Ok(actual_fen) => {
                 tx.execute("INSERT INTO deep_tree_nodes(project_id,source_task_id,fen,history,ply) VALUES(?1,?2,?3,?4,?5)",
                 params![project_id,task_id,actual_fen,moves_json,ply]).map_err(|e|e.to_string())?;
+                position_graph::link_node(&tx, tx.last_insert_rowid())?;
             }
             Err(e) => log::warn!("Skipped invalid legacy Deep Analysis root {task_id}: {e}"),
         }
