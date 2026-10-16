@@ -226,6 +226,77 @@ mod graph_tests {
     use shakmaty::{fen::Fen, EnPassantMode};
 
     #[test]
+    fn pre_position_schema_preserves_results_and_rebuilds_transposed_paths() {
+        use crate::deep_analysis::parse_line;
+        use rusqlite::{params, Connection};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-position.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE deep_projects(id TEXT PRIMARY KEY,title TEXT NOT NULL,engine TEXT NOT NULL,depth INTEGER NOT NULL DEFAULT 0,time_ms INTEGER NOT NULL,multipv INTEGER NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT (datetime('now')));
+            CREATE TABLE deep_tasks(id TEXT PRIMARY KEY,project_id TEXT NOT NULL,parent_task_id TEXT,fen TEXT NOT NULL,moves TEXT NOT NULL DEFAULT '[]',ply INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'queued',error TEXT);
+            CREATE TABLE deep_results(task_id TEXT NOT NULL,multipv INTEGER NOT NULL,depth INTEGER NOT NULL,score_kind TEXT NOT NULL,score_value INTEGER NOT NULL,score_perspective TEXT NOT NULL DEFAULT 'white',uci_moves TEXT NOT NULL,PRIMARY KEY(task_id,multipv));
+            PRAGMA user_version=3;").unwrap();
+        let engine = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        conn.execute("INSERT INTO deep_projects(id,title,engine,time_ms,multipv,status) VALUES('old','pre-position',?1,100,2,'paused')",[&engine]).unwrap();
+        conn.execute("INSERT INTO deep_tasks(id,project_id,fen,moves,ply,status) VALUES('root','old',?1,'[]',0,'completed')",[start_fen()]).unwrap();
+        let paths = ["g1f3 g8f6 b1c3 b8c6", "b1c3 b8c6 g1f3 g8f6"];
+        for (i, path) in paths.iter().enumerate() {
+            conn.execute("INSERT INTO deep_results(task_id,multipv,depth,score_kind,score_value,score_perspective,uci_moves) VALUES('root',?1,12,'cp',20,'white',?2)",
+                params![i+1,serde_json::to_string(&path.split_whitespace().collect::<Vec<_>>()).unwrap()]).unwrap();
+        }
+        drop(conn);
+        let store = Store::open(&path).unwrap();
+        let tree = store.read_tree("old").unwrap();
+        let final_fen = Fen::from_position(
+            position_after(
+                &start_fen(),
+                &paths[0]
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let leaves: Vec<_> = tree.iter().filter(|n| n.fen == final_fen).collect();
+        assert_eq!(leaves.len(), 2);
+        assert_ne!(leaves[0].id, leaves[1].id);
+        assert_eq!(leaves[0].position_id, leaves[1].position_id);
+        assert_eq!(store.list_tasks("old").unwrap().len(), 1);
+        assert_eq!(store.results("old").unwrap()[0].lines.len(), 2);
+        assert_eq!(store.status("old").unwrap(), "paused");
+        store.begin_running("old", "paused").unwrap();
+        let task = store
+            .queue_at_occurrence("old", "root", &final_fen, 4, leaves[1].id.parse().unwrap())
+            .unwrap();
+        assert_eq!(store.claim("old").unwrap().unwrap().id, task.id);
+        store
+            .save(
+                &task.id,
+                &[parse_line("info depth 16 score cp 30 pv e2e4", &final_fen, &[]).unwrap()],
+            )
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        let tree = reopened.read_tree("old").unwrap();
+        assert_eq!(tree.iter().filter(|n| n.fen == final_fen).count(), 2);
+        assert_eq!(reopened.list_tasks("old").unwrap().len(), 2);
+        assert_eq!(reopened.results("old").unwrap().len(), 2);
+        assert_eq!(
+            reopened
+                .conn()
+                .unwrap()
+                .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+    }
+
+    #[test]
     fn legacy_result_replay_installs_interests_schema_before_rebuilding_tree() {
         use crate::deep_analysis::parse_line;
         let dir = tempfile::tempdir().unwrap();
