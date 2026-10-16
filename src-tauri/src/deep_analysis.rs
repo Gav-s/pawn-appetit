@@ -383,10 +383,10 @@ impl Store {
         };
         let mut query = conn.prepare("SELECT n.id,n.fen,n.ply,n.source_task_id,p.minimax_score_kind,p.minimax_score_value,
             (SELECT count(*) FROM deep_tree_nodes sibling WHERE sibling.parent_id=n.parent_id),
-            EXISTS(SELECT 1 FROM deep_results r WHERE r.task_id=p.analyzed_task_id AND r.multipv=1 AND json_extract(r.uci_moves,'$[0]')=n.move_uci)
+            EXISTS(SELECT 1 FROM deep_results r WHERE r.task_id=p.analyzed_task_id AND r.multipv=1 AND json_extract(r.uci_moves,'$[0]')=n.move_uci),n.position_id
             FROM deep_tree_nodes n JOIN deep_tree_nodes p ON p.id=n.parent_id
             WHERE n.project_id=?1 AND n.direct_score_kind IS NULL AND n.ply<=?2
-              AND p.minimax_score_kind IS NOT NULL AND NOT EXISTS(SELECT 1 FROM deep_tasks t WHERE t.occurrence_id=n.id)
+              AND p.minimax_score_kind IS NOT NULL AND NOT EXISTS(SELECT 1 FROM deep_task_interests i WHERE i.node_id=n.id)
             ORDER BY n.id").map_err(|e| e.to_string())?;
         let eligible: Vec<(scheduler::Candidate, String, String)> = query
             .query_map(
@@ -401,18 +401,20 @@ impl Store {
                         r.get::<_, i32>(5)?,
                         r.get::<_, u32>(6)?,
                         r.get::<_, bool>(7)?,
+                        r.get::<_, i64>(8)?,
                     ))
                 },
             )
             .map_err(|e| e.to_string())?
             .map(|row| {
-                let (id, fen, ply, source, kind, value, siblings, preferred) =
+                let (id, fen, ply, source, kind, value, siblings, preferred, position_id) =
                     row.map_err(|e| e.to_string())?;
                 let index =
                     score::AnalysisScore::from_stored(Some(&kind), Some(value))?.tree_index();
                 Ok(index.map(|index| {
                     (
-                        scheduler::Candidate::new(id, index, ply, preferred, siblings),
+                        scheduler::Candidate::new(id, index, ply, preferred, siblings)
+                            .with_position(position_id),
                         fen,
                         source,
                     )
@@ -477,8 +479,47 @@ impl Store {
                         Err(_e) if self.status(project_id)? != "running" => return Ok(false),
                         Err(e) => return Err(e),
                     };
-                    self.conn()?.execute("UPDATE deep_tasks SET strategy=?2,remaining_prolong=?3,priority=0 WHERE id=?1",
-                        params![task.id,format!("{stage:?}"),if stage==scheduler::Stage::Prolong { i64::from(settings.prolong_depth) } else { 0 }]).map_err(|e|e.to_string())?;
+                    let stage_name = format!("{stage:?}");
+                    let remaining = if stage == scheduler::Stage::Prolong {
+                        settings.prolong_depth
+                    } else {
+                        0
+                    };
+                    let position_id = eligible
+                        .iter()
+                        .find(|(c, _, _)| c.occurrence_id == id)
+                        .ok_or("missing candidate position")?
+                        .0
+                        .position_id;
+                    let mut conn = self.conn()?;
+                    let tx = conn
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .map_err(|e| e.to_string())?;
+                    // Preserve a running/manual task's original strategy and priority. The
+                    // selected stage is recorded on every interested transposed path.
+                    tx.execute("UPDATE deep_tasks SET
+                        strategy=CASE WHEN strategy='manual' AND priority=0 THEN ?2 ELSE strategy END,
+                        remaining_prolong=MAX(remaining_prolong,?3)
+                        WHERE id=?1 AND status='queued'",
+                        params![task.id,stage_name,remaining]).map_err(|e|e.to_string())?;
+                    for (candidate, _, _) in eligible
+                        .iter()
+                        .filter(|(c, _, _)| c.position_id == position_id)
+                    {
+                        task_spec::add_interest(
+                            &tx,
+                            &task.id,
+                            candidate.occurrence_id,
+                            if candidate.occurrence_id == id {
+                                &stage_name
+                            } else {
+                                "Transposition"
+                            },
+                            0,
+                            remaining,
+                        )?;
+                    }
+                    tx.commit().map_err(|e| e.to_string())?;
                 }
                 return Ok(true);
             }
@@ -4214,6 +4255,54 @@ mod tests {
                 .unwrap();
             assert_eq!(parent_minimax, Some(37));
         }
+    }
+
+    #[test]
+    fn automatic_candidate_generation_counts_transposed_positions_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("automatic-transposition.sqlite")).unwrap();
+        let project = store
+            .create_project(
+                "auto-transposition",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                100,
+                2,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        let settings = scheduler::AnalysisSettings {
+            max_ply: 4,
+            max_positions: 1,
+            ..Default::default()
+        };
+        store.enable_automatic(&project.id, &settings).unwrap();
+        store.begin_running(&project.id, "paused").unwrap();
+        let root = store.claim(&project.id).unwrap().unwrap();
+        let paths = ["g1f3 g8f6 b1c3 b8c6", "b1c3 b8c6 g1f3 g8f6"];
+        let lines = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                parse_line(
+                    &format!("info depth 12 multipv {} score cp 0 pv {p}", i + 1),
+                    &root.fen,
+                    &[],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        store.save(&root.id, &lines).unwrap();
+        let conn = store.conn().unwrap();
+        conn.execute("UPDATE deep_tree_nodes SET direct_score_kind='cp',direct_score_value=0,minimax_score_kind='cp',minimax_score_value=0 WHERE project_id=?1 AND ply BETWEEN 1 AND 3",[&project.id]).unwrap();
+        drop(conn);
+        assert!(store.generate_next(&project.id).unwrap());
+        let conn = store.conn().unwrap();
+        let (task_count,interest_count):(i64,i64)=conn.query_row("SELECT
+            (SELECT count(*) FROM deep_tasks WHERE project_id=?1 AND status='queued'),
+            (SELECT count(DISTINCT i.node_id) FROM deep_task_interests i JOIN deep_tasks t ON t.id=i.task_id WHERE t.project_id=?1 AND t.status='queued')",
+            [&project.id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!((task_count, interest_count), (1, 2));
     }
 
     #[test]

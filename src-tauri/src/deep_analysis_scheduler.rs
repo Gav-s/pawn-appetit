@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub occurrence_id: i64,
+    /// Canonical position shared by transposed occurrences; defaults to the occurrence ID.
+    pub position_id: i64,
     pub index: u8,
     pub ply: u32,
     pub preferred: bool,
@@ -15,15 +17,23 @@ impl Candidate {
     pub fn new(occurrence_id: i64, index: u8, ply: u32, preferred: bool, siblings: u32) -> Self {
         Self {
             occurrence_id,
+            position_id: occurrence_id,
             index,
             ply,
             preferred,
             siblings,
         }
     }
+
+    pub fn with_position(mut self, position_id: i64) -> Self {
+        self.position_id = position_id;
+        self
+    }
 }
 
-/// Bounded, independently testable candidate ranking. No legal moves are invented here.
+/// Bounded, independently testable candidate ranking. Returns occurrence IDs, at most one
+/// per eligible canonical position. Stage filters precede deduplication; no legal moves are
+/// invented here.
 pub fn select_candidates<R: Rng + ?Sized>(
     stage: Stage,
     root_index: u8,
@@ -46,7 +56,13 @@ pub fn select_candidates<R: Rng + ?Sized>(
         for extra in (0..=52u8).step_by(3).chain(std::iter::once(52)) {
             let delta = settings.max_delta.saturating_add(extra);
             chosen = available.iter().filter(|c| in_range(c, delta)).collect();
-            if !chosen.is_empty() {
+            if chosen
+                .iter()
+                .map(|c| c.position_id)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                >= limit
+            {
                 break;
             }
         }
@@ -65,6 +81,9 @@ pub fn select_candidates<R: Rng + ?Sized>(
             _ => true,
         })
         .collect();
+    choices.sort_by_key(|c| (c.index.abs_diff(root_index), c.ply, c.occurrence_id));
+    let mut seen = std::collections::HashSet::new();
+    choices.retain(|c| seen.insert(c.position_id));
     if stage == Stage::Random {
         let mut output = Vec::new();
         while !choices.is_empty() && output.len() < limit {
@@ -88,7 +107,6 @@ pub fn select_candidates<R: Rng + ?Sized>(
         }
         return output;
     }
-    choices.sort_by_key(|c| (c.index.abs_diff(root_index), c.ply, c.occurrence_id));
     choices
         .into_iter()
         .take(limit)
@@ -229,6 +247,47 @@ mod tests {
     }
 
     #[test]
+    fn base_budget_counts_unique_positions_not_occurrences() {
+        let settings = AnalysisSettings {
+            max_delta: 4,
+            max_positions: 2,
+            ..Default::default()
+        };
+        let candidates = vec![
+            Candidate::new(1, 50, 1, true, 2).with_position(100),
+            Candidate::new(2, 51, 1, true, 2).with_position(100),
+            Candidate::new(3, 52, 1, true, 2).with_position(200),
+        ];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+        assert_eq!(
+            select_candidates(Stage::Base, 50, &candidates, &settings, &mut rng),
+            vec![1, 3]
+        );
+        assert_eq!(candidates[0].occurrence_id, 1);
+        assert_eq!(candidates[0].position_id, 100);
+        assert_eq!(Candidate::new(7, 50, 0, false, 0).position_id, 7);
+    }
+
+    #[test]
+    fn base_widens_to_fill_unique_position_budget() {
+        let settings = AnalysisSettings {
+            max_delta: 0,
+            max_positions: 2,
+            ..Default::default()
+        };
+        let candidates = vec![
+            Candidate::new(1, 50, 1, true, 2).with_position(100),
+            Candidate::new(2, 50, 2, true, 2).with_position(100),
+            Candidate::new(3, 53, 1, true, 2).with_position(200),
+        ];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        assert_eq!(
+            select_candidates(Stage::Base, 50, &candidates, &settings, &mut rng),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
     fn alternative_requires_meaningful_sibling_and_filters_before_random() {
         let settings = AnalysisSettings {
             max_delta: 4,
@@ -274,6 +333,52 @@ mod tests {
         let a = draw(123);
         assert_eq!(a, draw(123));
         assert!(a.iter().filter(|&&id| id == 1).count() > a.iter().filter(|&&id| id == 2).count());
+    }
+
+    #[test]
+    fn alternatives_filter_occurrences_before_deduplicating_positions() {
+        let settings = AnalysisSettings {
+            max_delta: 4,
+            max_positions: 2,
+            ..Default::default()
+        };
+        let candidates = vec![
+            Candidate::new(1, 50, 1, true, 2).with_position(100),
+            Candidate::new(2, 51, 1, false, 2).with_position(100),
+            Candidate::new(3, 50, 1, false, 1).with_position(200),
+            Candidate::new(4, 52, 1, false, 2).with_position(200),
+        ];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        assert_eq!(
+            select_candidates(Stage::Alternatives, 50, &candidates, &settings, &mut rng),
+            vec![2, 4]
+        );
+    }
+
+    #[test]
+    fn random_samples_unique_positions_with_seeded_reproducibility() {
+        let settings = AnalysisSettings {
+            max_delta: 4,
+            max_positions: 2,
+            ..Default::default()
+        };
+        let candidates = vec![
+            Candidate::new(1, 50, 1, true, 2).with_position(100),
+            Candidate::new(2, 50, 2, true, 2).with_position(100),
+            Candidate::new(3, 52, 1, true, 2).with_position(200),
+        ];
+        let sample = |seed| {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            select_candidates(Stage::Random, 50, &candidates, &settings, &mut rng)
+        };
+        for seed in 0..32 {
+            let chosen = sample(seed);
+            assert_eq!(chosen, sample(seed));
+            assert_eq!(chosen.len(), 2);
+            assert!(chosen.contains(&1));
+            assert!(chosen.contains(&3));
+            assert!(!chosen.contains(&2));
+        }
     }
 
     #[test]
