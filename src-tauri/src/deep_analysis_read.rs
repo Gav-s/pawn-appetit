@@ -57,6 +57,8 @@ pub struct AnalysisProjectSummary {
 pub struct AnalysisNodeView {
     pub id: String,
     pub parent_id: Option<String>,
+    pub position_id: String,
+    pub transposition_count: u32,
     pub move_uci: Option<String>,
     pub move_san: Option<String>,
     pub fen: String,
@@ -107,6 +109,8 @@ pub struct SchedulerView {
 struct RawNode {
     id: i64,
     parent_id: Option<i64>,
+    position_id: i64,
+    transposition_count: u32,
     move_uci: Option<String>,
     fen: String,
     parent_fen: Option<String>,
@@ -170,7 +174,10 @@ impl Store {
         let mut stmt=conn.prepare("SELECT n.id,n.parent_id,n.move_uci,n.fen,p.fen,n.direct_score_kind,n.direct_score_value,
            n.minimax_score_kind,n.minimax_score_value,n.direct_depth,r.uci_moves,n.analyzed_task_id,
            (SELECT t.status FROM deep_tasks t WHERE t.occurrence_id=n.id ORDER BY CASE t.status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,t.rowid DESC LIMIT 1),
-           src.status FROM deep_tree_nodes n LEFT JOIN deep_tree_nodes p ON p.id=n.parent_id
+           src.status,n.position_id,
+           (SELECT count(*) FROM deep_tree_nodes other
+            WHERE other.project_id=n.project_id AND other.position_id=n.position_id)
+           FROM deep_tree_nodes n LEFT JOIN deep_tree_nodes p ON p.id=n.parent_id
            JOIN deep_tasks src ON src.id=n.source_task_id
            LEFT JOIN deep_results r ON r.task_id=n.analyzed_task_id AND r.multipv=1
            WHERE n.project_id=?1 ORDER BY n.ply,n.id").map_err(|e|e.to_string())?;
@@ -191,6 +198,8 @@ impl Store {
                     analyzed_task: r.get(11)?,
                     linked_status: r.get(12)?,
                     source_status: r.get(13)?,
+                    position_id: r.get(14)?,
+                    transposition_count: r.get(15)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -244,6 +253,8 @@ impl Store {
                 Ok(AnalysisNodeView {
                     id: n.id.to_string(),
                     parent_id: n.parent_id.map(|id| id.to_string()),
+                    position_id: n.position_id.to_string(),
+                    transposition_count: n.transposition_count,
                     move_uci: n.move_uci,
                     move_san,
                     fen: n.fen,
@@ -261,7 +272,7 @@ impl Store {
                     engine: Some(engine.clone()),
                     minimax_evaluation: minimax.into(),
                     status: status.into(),
-                    transposition_linked: false,
+                    transposition_linked: n.transposition_count > 1,
                 })
             })
             .collect()
@@ -373,7 +384,8 @@ pub(super) fn restore_missing_roots(conn: &mut Connection) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::EvaluationView;
-    use crate::deep_analysis::{parse_line, start_fen, Store};
+    use crate::deep_analysis::{parse_line, position_after, start_fen, Store};
+    use shakmaty::{fen::Fen, EnPassantMode};
 
     #[test]
     fn node_ids_are_json_safe_strings_for_tauri() {
@@ -391,6 +403,70 @@ mod tests {
             .unwrap();
         let node = store.read_tree(&p.id).unwrap().remove(0);
         assert!(serde_json::to_value(&node).unwrap()["id"].is_string());
+    }
+
+    #[test]
+    fn transposed_paths_share_position_id_and_count_but_retain_occurrence_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("transpositions.sqlite")).unwrap();
+        let project = store
+            .create_project(
+                "Transposed paths",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                100,
+                2,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        let task = store.list_tasks(&project.id).unwrap().remove(0);
+        store.begin_running(&project.id, "paused").unwrap();
+        store.claim(&project.id).unwrap();
+        store
+            .save(
+                &task.id,
+                &[
+                    parse_line(
+                        "info depth 8 multipv 1 score cp 20 pv g1f3 g8f6 b1c3 b8c6",
+                        &task.fen,
+                        &[],
+                    )
+                    .unwrap(),
+                    parse_line(
+                        "info depth 8 multipv 2 score cp 10 pv b1c3 b8c6 g1f3 g8f6",
+                        &task.fen,
+                        &[],
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+        let tree = store.read_tree(&project.id).unwrap();
+        let final_fen = Fen::from_position(
+            position_after(
+                &start_fen(),
+                &["g1f3", "g8f6", "b1c3", "b8c6"].map(str::to_string),
+            )
+            .unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let leaves: Vec<_> = tree.iter().filter(|node| node.fen == final_fen).collect();
+        assert_eq!(leaves.len(), 2);
+        assert_ne!(leaves[0].id, leaves[1].id);
+        assert_ne!(leaves[0].parent_id, leaves[1].parent_id);
+        assert_eq!(leaves[0].position_id, leaves[1].position_id);
+        assert_eq!(leaves[0].fen, leaves[1].fen);
+        for node in leaves {
+            assert_eq!(node.transposition_count, 2);
+            assert!(node.transposition_linked);
+            let wire = serde_json::to_value(node).unwrap();
+            assert!(wire["positionId"].is_string());
+            assert_eq!(wire["transpositionCount"], 2);
+        }
+        assert!(tree
+            .iter()
+            .any(|node| node.transposition_count == 1 && !node.transposition_linked));
     }
 
     #[test]

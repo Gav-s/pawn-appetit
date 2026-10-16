@@ -58,6 +58,8 @@ const summary: AnalysisProjectSummary = {
 const rootNode: AnalysisNodeView = {
   id: "1",
   parentId: null,
+  positionId: "1",
+  transpositionCount: 1,
   moveUci: null,
   moveSan: null,
   fen: FEN,
@@ -378,6 +380,52 @@ describe("Deep Analysis desktop workflow", () => {
     expect(after).not.toContain("transform: translate(400px,600px);");
     expect(after.filter((position) => !before.includes(position))).toHaveLength(1);
     expect(before.filter((position) => !after.includes(position))).toHaveLength(1);
+  });
+
+  it("marks both paths to a shared position and keeps occurrence selection on the same board", async () => {
+    const service = fixture(true);
+    const finalFen = "r1bqkb1r/pppppppp/2n2n2/8/8/2N2N2/PPPPPPPP/R1BQKB1R w KQkq - 4 3";
+    const first: AnalysisNodeView = {
+      ...rootNode,
+      id: "8",
+      parentId: "7",
+      positionId: "42",
+      transpositionCount: 2,
+      transpositionLinked: true,
+      moveUci: "b8c6",
+      moveSan: "Nc6",
+      fen: finalFen,
+    };
+    const second: AnalysisNodeView = {
+      ...first,
+      id: "9",
+      parentId: "6",
+      moveUci: "g8f6",
+      moveSan: "Nf6",
+    };
+    vi.mocked(service.getTree).mockResolvedValue([rootNode, first, second]);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, 0, 800, 800),
+    );
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      callback(performance.now() + 1000);
+      return 1;
+    });
+    await render(service);
+    const tree = host.querySelector('[role="tree"]')!;
+    expect(tree.textContent).not.toContain("Transposition · 1 paths");
+    expect(tree.textContent?.match(/Transposition · 2 paths/g)).toHaveLength(2);
+    const selectedFen = () =>
+      [...host.querySelectorAll("h5")].find((heading) => heading.textContent === "Selected node")
+        ?.nextElementSibling?.textContent;
+    const board = host.querySelector("cg-board")!;
+    for (const move of ["Nc6", "Nf6"]) {
+      await click(move);
+      expect(selectedFen()).toBe(finalFen);
+      expect(tree.querySelector(`[aria-selected="true"]`)?.textContent).toBe(move);
+      expect([...board.querySelectorAll("piece.white.knight")].map((piece) => piece.getAttribute("style")))
+        .toEqual(expect.arrayContaining(["transform: translate(200px,500px);", "transform: translate(500px,500px);"]));
+    }
   });
 
   it("starts automatic analysis from the persisted project and stops while retaining work", async () => {

@@ -466,6 +466,11 @@ export default function DeepAnalysisPage({
                           {node.status}
                         </Text>
                         {node.treeIndex !== null && <Text size="xs">#{node.treeIndex}</Text>}
+                        {node.transpositionCount > 1 && (
+                          <Badge size="sm" variant="light">
+                            Transposition · {node.transpositionCount} paths
+                          </Badge>
+                        )}
                       </Group>
                     ))}
                   </Stack>

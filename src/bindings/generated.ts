@@ -786,7 +786,7 @@ reportProgress: "report-progress"
 /** user-defined types **/
 
 export type AnalysisChange = "project_state_changed" | "scheduler_stage_changed" | "task_queued" | "task_started" | "task_completed" | "tree_node_updated" | "minimax_updated" | "engine_state_changed" | "project_exhausted" | "project_failed"
-export type AnalysisNodeView = { id: string; parentId: string | null; moveUci: string | null; moveSan: string | null; fen: string; sideToMove: string; rawEvaluation: EvaluationView; treeIndex: number | null; depth: number | null; elapsedMs: number | null; pv: string[]; engine: string | null; minimaxEvaluation: EvaluationView; status: string; transpositionLinked: boolean }
+export type AnalysisNodeView = { id: string; parentId: string | null; positionId: string; transpositionCount: number; moveUci: string | null; moveSan: string | null; fen: string; sideToMove: string; rawEvaluation: EvaluationView; treeIndex: number | null; depth: number | null; elapsedMs: number | null; pv: string[]; engine: string | null; minimaxEvaluation: EvaluationView; status: string; transpositionLinked: boolean }
 /**
  * Options for full-game analysis (FEN, moves, novelty annotation, etc).
  */
