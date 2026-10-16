@@ -14,6 +14,7 @@ import type {
 } from "../service";
 
 const FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+const AFTER_E4_FEN = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1";
 const project = {
   id: "p1",
   title: "Opening study",
@@ -114,6 +115,7 @@ afterEach(async () => {
     root = undefined;
   }
   host?.remove();
+  vi.restoreAllMocks();
 });
 
 async function render(
@@ -328,6 +330,54 @@ describe("Deep Analysis desktop workflow", () => {
     expect(host.textContent).toContain(child.fen);
     await click("Prolong selected node");
     expect(service.manualProlong).toHaveBeenCalledWith("p1", "2", 1);
+  });
+
+  it("renders the selected occurrence on the existing board when a pawn moves from e2 to e4", async () => {
+    const service = fixture(true);
+    const child: AnalysisNodeView = {
+      ...rootNode,
+      id: "2",
+      parentId: "1",
+      moveUci: "e2e4",
+      moveSan: "e4",
+      fen: AFTER_E4_FEN,
+      sideToMove: "black",
+      status: "unanalysed",
+    };
+    vi.mocked(service.getTree).mockResolvedValue([rootNode, child]);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, 0, 800, 800),
+    );
+    // Finish Chessground's animation frame deterministically in jsdom.
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      callback(performance.now() + 1000);
+      return 1;
+    });
+    await render(service);
+
+    const selectedFen = () =>
+      [...host.querySelectorAll("h5")].find((heading) => heading.textContent === "Selected node")
+        ?.nextElementSibling?.textContent;
+    const board = host.querySelector("cg-board");
+    expect(board).toBeTruthy();
+    const pawnPositions = () =>
+      [...board!.querySelectorAll("piece.white.pawn")]
+        .map((piece) => piece.getAttribute("style"))
+        .sort();
+
+    expect(selectedFen()).toBe(FEN);
+    const before = pawnPositions();
+    expect(before).toHaveLength(8);
+    expect(before).toContain("transform: translate(400px,600px);"); // e2
+    await click("e4");
+    expect(selectedFen()).toBe(AFTER_E4_FEN);
+    expect(host.querySelector("cg-board")).toBe(board);
+    const after = pawnPositions();
+    expect(after).toHaveLength(8);
+    expect(after).toContain("transform: translate(400px,400px);"); // e4
+    expect(after).not.toContain("transform: translate(400px,600px);");
+    expect(after.filter((position) => !before.includes(position))).toHaveLength(1);
+    expect(before.filter((position) => !after.includes(position))).toHaveLength(1);
   });
 
   it("starts automatic analysis from the persisted project and stops while retaining work", async () => {
