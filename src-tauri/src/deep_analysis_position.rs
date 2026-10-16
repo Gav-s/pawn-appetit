@@ -384,6 +384,104 @@ mod tests {
     }
 
     #[test]
+    fn migration_indexes_many_transposed_occurrences_without_merging_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many-transpositions.sqlite");
+        let store = Store::open(&path).unwrap();
+        let project = store
+            .create_project(
+                "many",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                100,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        let mut conn = store.conn().unwrap();
+        let tx = conn.transaction().unwrap();
+        for fullmove in 2..=129 {
+            let task_id = format!("legacy-transposition-{fullmove}");
+            let fen = start_fen().replace(" 0 1", &format!(" 0 {fullmove}"));
+            tx.execute("INSERT INTO deep_tasks(id,project_id,fen,moves,ply,status) VALUES(?1,?2,?3,'[]',0,'queued')", params![task_id,project.id,fen]).unwrap();
+            tx.execute("INSERT INTO deep_tree_nodes(project_id,source_task_id,fen,history,ply) VALUES(?1,?2,?3,'[]',0)",params![project.id,task_id,fen]).unwrap();
+        }
+        tx.commit().unwrap();
+        drop(conn);
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        let conn = reopened.conn().unwrap();
+        let (nodes, positions, missing): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+            (SELECT count(*) FROM deep_tree_nodes WHERE project_id=?1),
+            (SELECT count(*) FROM deep_position_records WHERE project_id=?1),
+            (SELECT count(*) FROM deep_tree_nodes WHERE project_id=?1 AND position_id IS NULL)",
+                [&project.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((nodes, positions, missing), (129, 1, 0));
+        let plan:String=conn.query_row("EXPLAIN QUERY PLAN SELECT id FROM deep_position_records WHERE project_id=?1 AND position_key=?2",params![project.id,identity(&start_fen()).unwrap().key],|r|r.get(3)).unwrap();
+        assert!(
+            plan.contains("deep_position_lookup"),
+            "lookup did not use position-key index: {plan}"
+        );
+    }
+
+    #[test]
+    fn failed_position_backfill_rolls_back_links_and_new_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("rollback.sqlite")).unwrap();
+        let project = store
+            .create_project(
+                "rollback",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                100,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        let good = Fen::from_position(
+            position_after(&start_fen(), &["e2e4".to_owned()]).unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let mut conn = store.conn().unwrap();
+        let before: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM deep_position_records WHERE project_id=?1",
+                [&project.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let tx = conn.transaction().unwrap();
+        for (suffix, fen) in [("good", good), ("bad", "not a FEN".to_owned())] {
+            let task = format!("rollback-{suffix}");
+            tx.execute("INSERT INTO deep_tasks(id,project_id,fen,moves,ply,status) VALUES(?1,?2,?3,'[]',0,'queued')",params![task,project.id,fen]).unwrap();
+            tx.execute("INSERT INTO deep_tree_nodes(project_id,source_task_id,fen,history,ply) VALUES(?1,?2,?3,'[]',0)",params![project.id,task,fen]).unwrap();
+        }
+        tx.commit().unwrap();
+        assert!(migrate(&mut conn).is_err());
+        let after: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM deep_position_records WHERE project_id=?1",
+                [&project.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let missing: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM deep_tree_nodes WHERE project_id=?1 AND position_id IS NULL",
+                [&project.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!((before, after, missing), (1, 1, 2));
+    }
+
+    #[test]
     fn hash_collision_does_not_merge_different_canonical_positions() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("collision.sqlite")).unwrap();
