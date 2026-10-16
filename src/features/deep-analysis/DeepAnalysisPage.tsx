@@ -170,7 +170,9 @@ export default function DeepAnalysisPage({
   const summary = summaries.find((item) => item.id === selectedId);
   const selectedNode = tree.find((node) => node.id === selectedNodeId) ?? tree[0];
   const isRunning = project?.status === "running";
-  const isPaused = project?.status === "paused" || project?.status === "stopped";
+  const isPausing = project?.status === "pausing";
+  const isPaused =
+    project?.status === "paused" || project?.status === "stopped" || project?.status === "failed";
   const hasQueuedTasks = tasks.some((task) => task.status === "queued");
 
   async function perform(action: () => Promise<unknown>, projectId?: string) {
@@ -358,19 +360,36 @@ export default function DeepAnalysisPage({
                   Queue root position
                 </Button>
                 <Button
-                  disabled={busy || isRunning || !hasQueuedTasks || project.status === "cancelled"}
+                  disabled={
+                    busy ||
+                    isRunning ||
+                    isPausing ||
+                    !hasQueuedTasks ||
+                    project.status === "cancelled"
+                  }
                   onClick={() => void perform(() => service.startAutomatic(project.id), project.id)}
                 >
                   Start analysis
                 </Button>
                 {isRunning && (
-                  <Button
-                    disabled={busy}
-                    variant="default"
-                    onClick={() => void perform(() => service.pause(project.id), project.id)}
-                  >
-                    Pause analysis
-                  </Button>
+                  <>
+                    <Button
+                      disabled={busy}
+                      variant="default"
+                      onClick={() =>
+                        void perform(() => service.pauseAfterCurrent(project.id), project.id)
+                      }
+                    >
+                      Pause analysis
+                    </Button>
+                    <Button
+                      disabled={busy}
+                      variant="subtle"
+                      onClick={() => void perform(() => service.pause(project.id), project.id)}
+                    >
+                      Pause immediately
+                    </Button>
+                  </>
                 )}
                 {isPaused && hasQueuedTasks && (
                   <Button
@@ -515,9 +534,26 @@ export default function DeepAnalysisPage({
                   {taskViews
                     .filter((item) => item.state === "queued" || item.state === "running")
                     .map((item) => (
-                      <Text key={item.id} size="sm">
-                        {item.strategy} · {item.state} · Priority {item.priority}
-                      </Text>
+                      <Stack key={item.id} gap={0}>
+                        <Text size="sm">
+                          {item.strategy} · {item.state} · Priority {item.priority}
+                        </Text>
+                        <Text size="xs" c="dimmed">
+                          {item.requestedTimeMs ?? "—"} ms · depth {item.requestedDepth ?? "—"} ·{" "}
+                          {item.operationMode ?? "unknown"}
+                        </Text>
+                        <Text size="xs" c="dimmed">
+                          Source {item.sourceNodeId ?? "root"} · {item.remainingProlongCount}{" "}
+                          prolongs left
+                        </Text>
+                        <Text size="xs" c="dimmed">
+                          Profile {item.engineProfile} · MultiPV {item.requestedMultipv} · Cache{" "}
+                          {item.cachePolicy}
+                        </Text>
+                        <Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
+                          {item.engine}
+                        </Text>
+                      </Stack>
                     ))}
                   {taskViews.length === 0 && (
                     <Text c="dimmed" size="sm">

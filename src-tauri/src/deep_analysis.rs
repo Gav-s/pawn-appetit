@@ -24,6 +24,8 @@ mod read;
 mod scheduler;
 #[path = "deep_analysis_score.rs"]
 mod score;
+#[path = "deep_analysis_task.rs"]
+mod task_spec;
 #[path = "deep_analysis_tree.rs"]
 mod tree;
 
@@ -182,6 +184,7 @@ pub struct DeepAnalysisProgress {
     pub error: Option<String>,
 }
 
+#[derive(Clone)]
 struct Store {
     path: PathBuf,
 }
@@ -194,6 +197,8 @@ impl Store {
             path: path.to_owned(),
         };
         let mut conn = store.conn()?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| e.to_string())?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS deep_projects (
             id TEXT PRIMARY KEY, title TEXT NOT NULL, engine TEXT NOT NULL, depth INTEGER NOT NULL DEFAULT 0, time_ms INTEGER NOT NULL DEFAULT 1000,
             multipv INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'paused',
@@ -286,6 +291,7 @@ impl Store {
         }
         tree::backfill_legacy(&mut conn)?;
         read::restore_missing_roots(&mut conn)?;
+        task_spec::migrate(&mut conn)?;
         Ok(store)
     }
     fn conn(&self) -> Result<Connection, String> {
@@ -320,6 +326,9 @@ impl Store {
     }
     fn prepare_automatic_project(&self, id: &str) -> Result<(), String> {
         let project = self.get_project(id)?.ok_or("analysis project not found")?;
+        if matches!(project.status.as_str(), "running" | "pausing" | "cancelled") {
+            return Err("analysis project cannot start in its current state".into());
+        }
         if self.automatic(id)?.is_none() {
             let settings = scheduler::AnalysisSettings {
                 analysis_time_ms: project.time_ms,
@@ -476,7 +485,7 @@ impl Store {
         c.execute_batch(
             "BEGIN IMMEDIATE;
           UPDATE deep_tasks SET status='queued' WHERE status='running';
-          UPDATE deep_projects SET status='paused' WHERE status='running'; COMMIT;",
+          UPDATE deep_projects SET status='paused' WHERE status IN ('running','pausing'); COMMIT;",
         )
         .map_err(|e| e.to_string())
     }
@@ -802,7 +811,7 @@ impl Store {
         let tx = c.transaction().map_err(|e| e.to_string())?;
         let updated = tx
             .execute(
-                "UPDATE deep_projects SET status='failed' WHERE id=?1 AND status='running'",
+                "UPDATE deep_projects SET status='failed' WHERE id=?1 AND status IN ('running','pausing')",
                 [id],
             )
             .map_err(|e| e.to_string())?;
@@ -810,6 +819,34 @@ impl Store {
             tx.execute("UPDATE deep_tasks SET status='failed',error=?2 WHERE project_id=?1 AND status='running'", params![id,error]).map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())
+    }
+    fn pause_after_current(&self, id: &str) -> Result<(), String> {
+        let mut c = self.conn()?;
+        let tx = c.transaction().map_err(|e| e.to_string())?;
+        let updated = tx
+            .execute(
+                "UPDATE deep_projects SET status=CASE WHEN EXISTS(
+                SELECT 1 FROM deep_tasks WHERE project_id=?1 AND status='running'
+            ) THEN 'pausing' ELSE 'paused' END
+            WHERE id=?1 AND status IN ('running','pausing','paused')",
+                [id],
+            )
+            .map_err(|e| e.to_string())?;
+        if updated == 0 {
+            return Err("project is not running or paused".into());
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+    fn complete_pause_after_current(&self, id: &str) -> Result<bool, String> {
+        let updated = self
+            .conn()?
+            .execute(
+                "UPDATE deep_projects SET status='paused' WHERE id=?1 AND status='pausing'
+            AND NOT EXISTS(SELECT 1 FROM deep_tasks WHERE project_id=?1 AND status='running')",
+                [id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(updated != 0)
     }
     fn pause(&self, id: &str) -> Result<(), String> {
         let mut c = self.conn()?;
@@ -914,7 +951,7 @@ impl Store {
         // A pause/cancel can race an engine line: the write and status check must be atomic.
         c.execute("INSERT INTO deep_results(task_id,multipv,depth,score_kind,score_value,score_perspective,uci_moves)
             SELECT t.id,?2,?3,?4,?5,?6,?7 FROM deep_tasks t JOIN deep_projects p ON p.id=t.project_id
-            WHERE t.id=?1 AND t.status='running' AND p.status='running'
+            WHERE t.id=?1 AND t.status='running' AND p.status IN ('running','pausing')
             ON CONFLICT(task_id,multipv) DO UPDATE SET depth=excluded.depth,score_kind=excluded.score_kind,
                 score_value=excluded.score_value,score_perspective=excluded.score_perspective,uci_moves=excluded.uci_moves
             WHERE excluded.depth >= deep_results.depth",
@@ -983,7 +1020,7 @@ impl Store {
         }
         let mut c = self.conn()?;
         let tx = c.transaction().map_err(|e| e.to_string())?;
-        let running:i64=tx.query_row("SELECT count(*) FROM deep_tasks t JOIN deep_projects p ON p.id=t.project_id WHERE t.id=?1 AND t.status='running' AND p.status='running'",[task_id],|r|r.get(0)).map_err(|e|e.to_string())?;
+        let running:i64=tx.query_row("SELECT count(*) FROM deep_tasks t JOIN deep_projects p ON p.id=t.project_id WHERE t.id=?1 AND t.status='running' AND p.status IN ('running','pausing')",[task_id],|r|r.get(0)).map_err(|e|e.to_string())?;
         if running == 0 {
             return Err("task is no longer running".into());
         }
@@ -1028,10 +1065,25 @@ impl Store {
                     .optional()
                     .map_err(|e| e.to_string())?;
                 if let Some((child_id, fen, ply)) = child {
+                    let next_id = uuid::Uuid::new_v4().to_string();
                     tx.execute("INSERT INTO deep_tasks(id,project_id,parent_task_id,fen,moves,ply,occurrence_id,priority,remaining_prolong,strategy)
                         VALUES(?1,?2,?3,?4,'[]',?5,?6,?7,?8,'Prolong')",
-                        params![uuid::Uuid::new_v4().to_string(),project_id,task_id,fen,ply,child_id,priority,remaining-1])
+                        params![next_id,project_id,task_id,fen,ply,child_id,priority,remaining-1])
                         .map_err(|e|e.to_string())?;
+                    // A chained prolong is part of its parent's original request, not a new global-settings request.
+                    tx.execute(
+                        "UPDATE deep_tasks SET
+                        execution_engine=(SELECT execution_engine FROM deep_tasks WHERE id=?2),
+                        engine_profile=(SELECT engine_profile FROM deep_tasks WHERE id=?2),
+                        requested_multipv=(SELECT requested_multipv FROM deep_tasks WHERE id=?2),
+                        requested_time_ms=(SELECT requested_time_ms FROM deep_tasks WHERE id=?2),
+                        requested_depth=(SELECT requested_depth FROM deep_tasks WHERE id=?2),
+                        operation_mode=(SELECT operation_mode FROM deep_tasks WHERE id=?2),
+                        cache_policy=(SELECT cache_policy FROM deep_tasks WHERE id=?2)
+                        WHERE id=?1",
+                        params![next_id, task_id],
+                    )
+                    .map_err(|e| e.to_string())?;
                 }
             }
         }
@@ -1125,6 +1177,18 @@ impl Drop for WorkerLease {
     }
 }
 impl DeepAnalysisState {
+    fn pause_after_current(&self, store: &Store, project_id: &str) -> Result<(), String> {
+        let active = self.active.lock().map_err(|e| e.to_string())?;
+        if active
+            .as_ref()
+            .is_some_and(|worker| worker.project_id == project_id)
+        {
+            store.pause_after_current(project_id)
+        } else {
+            // A missing worker cannot finish an orphaned running task.
+            store.pause(project_id)
+        }
+    }
     fn pause(&self, store: &Store, project_id: &str) -> Result<(), String> {
         let active = self.active.lock().map_err(|e| e.to_string())?;
         store.pause(project_id)?;
@@ -1185,8 +1249,23 @@ impl DeepAnalysisState {
         })
     }
 }
+static APP_STORE: Mutex<Option<Store>> = Mutex::new(None);
+
+fn cached_store(path: &Path, cache: &Mutex<Option<Store>>) -> Result<Store, String> {
+    let mut guard = cache.lock().map_err(|e| e.to_string())?;
+    if let Some(store) = guard.as_ref() {
+        if store.path != path {
+            return Err("analysis database path changed within one app process".into());
+        }
+        return Ok(store.clone());
+    }
+    let store = Store::open(path)?;
+    *guard = Some(store.clone());
+    Ok(store)
+}
+
 fn store(app: &tauri::AppHandle) -> Result<Store, String> {
-    Store::open(&database_path(app)?)
+    cached_store(&database_path(app)?, &APP_STORE)
 }
 pub fn recover_on_startup(app: &tauri::AppHandle) -> Result<(), String> {
     store(app)?.recover()
@@ -1368,6 +1447,19 @@ pub fn queue_deep_analysis_continuation(
 }
 #[tauri::command]
 #[specta::specta]
+pub fn pause_after_current_deep_analysis(
+    app: tauri::AppHandle,
+    project_id: String,
+) -> Result<(), String> {
+    let s = store(&app)?;
+    app.state::<DeepAnalysisState>()
+        .pause_after_current(&s, &project_id)?;
+    emit_update(&app, &project_id, AnalysisChange::ProjectStateChanged, None);
+    let _ = DeepAnalysisProgress::emit(&s.progress(&project_id, None, None)?, &app);
+    Ok(())
+}
+#[tauri::command]
+#[specta::specta]
 pub fn pause_deep_analysis(app: tauri::AppHandle, project_id: String) -> Result<(), String> {
     let s = store(&app)?;
     app.state::<DeepAnalysisState>().pause(&s, &project_id)?;
@@ -1431,7 +1523,7 @@ async fn launch(
     if initial_status == "cancelled" {
         return Err("cancelled project cannot resume".into());
     }
-    if initial_status == "running" {
+    if initial_status == "running" || initial_status == "pausing" {
         return Err("project already running".into());
     }
     let project = s.get_project(&project_id)?.ok_or("project not found")?;
@@ -1475,7 +1567,19 @@ async fn run_worker(
 ) -> Result<(), String> {
     let s = store(app)?;
     loop {
-        if cancelled.load(Ordering::Acquire) || s.status(project_id)? != "running" {
+        if cancelled.load(Ordering::Acquire) {
+            break;
+        }
+        let status = s.status(project_id)?;
+        if status == "pausing" {
+            if s.complete_pause_after_current(project_id)? {
+                emit_update(app, project_id, AnalysisChange::ProjectStateChanged, None);
+                emit_update(app, project_id, AnalysisChange::EngineStateChanged, None);
+                let _ = DeepAnalysisProgress::emit(&s.progress(project_id, None, None)?, app);
+            }
+            break;
+        }
+        if status != "running" {
             break;
         }
         let Some(task) = s.claim(project_id)? else {
@@ -1499,26 +1603,37 @@ async fn run_worker(
         let _ =
             DeepAnalysisProgress::emit(&s.progress(project_id, Some(task.id.clone()), None)?, app);
         let project = s.get_project(project_id)?.ok_or("project not found")?;
-        let outcome = match cached_for_project(&s, &project, &task) {
+        let outcome = match cached_for_project(&s, &task) {
             Ok(Some(lines)) => Ok((lines, None)),
-            Ok(None) => analyze_position_timed(&project, &task, &s, cancelled, Some(app))
-                .await
-                .map(|(lines, ms)| (lines, Some(ms))),
+            Ok(None) => {
+                let registration = app
+                    .path()
+                    .resolve("engines/engines.json", BaseDirectory::AppData)
+                    .map_err(|e| e.to_string())?;
+                registered_engine(&s.task_execution(&task.id)?.engine, &registration)?;
+                analyze_position_timed(&project, &task, &s, cancelled, Some(app))
+                    .await
+                    .map(|(lines, ms)| (lines, Some(ms)))
+            }
             Err(e) => Err(e),
         };
-        if cancelled.load(Ordering::Acquire) || s.status(project_id)? != "running" {
+        if cancelled.load(Ordering::Acquire)
+            || !matches!(s.status(project_id)?.as_str(), "running" | "pausing")
+        {
             s.requeue(&task.id)?;
             break;
         }
         match outcome {
             Ok((lines, elapsed)) => {
                 let saved = if let Some(ms) = elapsed {
-                    s.save_cached(&task.id, &lines, ms, &project.engine)
+                    s.save_cached(&task.id, &lines, ms, &s.task_execution(&task.id)?.engine)
                 } else {
                     s.save(&task.id, &lines)
                 };
                 if let Err(e) = saved {
-                    if cancelled.load(Ordering::Acquire) || s.status(project_id)? != "running" {
+                    if cancelled.load(Ordering::Acquire)
+                        || !matches!(s.status(project_id)?.as_str(), "running" | "pausing")
+                    {
                         s.requeue(&task.id)?;
                         break;
                     }
@@ -1563,17 +1678,10 @@ async fn run_worker(
 }
 fn cached_for_project(
     s: &Store,
-    project: &DeepAnalysisProject,
     task: &DeepAnalysisTask,
 ) -> Result<Option<Vec<DeepAnalysisLine>>, String> {
-    let settings = s.automatic(&project.id)?.map(|(settings, _, _)| settings);
-    let time_ms = settings
-        .as_ref()
-        .map_or(project.time_ms, |settings| settings.analysis_time_ms);
-    let depth = settings
-        .as_ref()
-        .map_or(12, |settings| settings.analysis_depth);
-    s.cached(task, &project.engine, project.multipv, time_ms, depth)
+    let spec = s.task_execution(&task.id)?;
+    s.cached(task, &spec.engine, spec.multipv, spec.time_ms, spec.depth)
 }
 
 #[cfg(test)]
@@ -1594,32 +1702,27 @@ async fn analyze_position_timed(
     cancelled: &AtomicBool,
     event_app: Option<&tauri::AppHandle>,
 ) -> Result<(Vec<DeepAnalysisLine>, u64), String> {
-    let requested = s.automatic(&project.id)?.map(|(settings, _, _)| settings);
-    let requested_time = requested
-        .as_ref()
-        .map_or(project.time_ms, |settings| settings.analysis_time_ms);
-    let requested_depth = requested
-        .as_ref()
-        .map_or(12, |settings| settings.analysis_depth);
-    let operation = requested
-        .as_ref()
-        .map_or(AnalysisOperation::TimeAndDepth, |settings| {
-            settings.analysis_operation
-        });
+    let spec = s.task_execution(&task.id)?;
+    let requested_time = spec.time_ms;
+    let requested_depth = spec.depth;
+    let operation = spec.operation;
     // Dropping a pending handshake kills its child (UciCommunicator uses kill_on_drop).
-    let handshake = EngineProcess::new(PathBuf::from(&project.engine));
+    let handshake = EngineProcess::new(PathBuf::from(&spec.engine));
     tokio::pin!(handshake);
     let (mut engine, mut reader) = loop {
         tokio::select! {
             result = &mut handshake => break result.map_err(|e| e.to_string())?,
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                if cancelled.load(Ordering::Acquire) || s.status(&project.id)? != "running" {
+                if cancelled.load(Ordering::Acquire)
+                    || !matches!(s.status(&project.id)?.as_str(), "running" | "pausing") {
                     return Err("interrupted".into());
                 }
             }
         }
     };
-    if cancelled.load(Ordering::Acquire) || s.status(&project.id)? != "running" {
+    if cancelled.load(Ordering::Acquire)
+        || !matches!(s.status(&project.id)?.as_str(), "running" | "pausing")
+    {
         let _ = engine.kill().await;
         return Err("interrupted".into());
     }
@@ -1630,7 +1733,7 @@ async fn analyze_position_timed(
                 moves: task.moves.clone(),
                 extra_options: vec![EngineOption {
                     name: "MultiPV".into(),
-                    value: project.multipv.to_string(),
+                    value: spec.multipv.to_string(),
                 }],
             })
             .await
@@ -1645,7 +1748,9 @@ async fn analyze_position_timed(
         let mut last_update = std::time::Instant::now() - Duration::from_secs(1);
         loop {
             let next = tokio::time::timeout(Duration::from_millis(50), reader.next_line()).await;
-            if cancelled.load(Ordering::Acquire) || s.status(&project.id)? != "running" {
+            if cancelled.load(Ordering::Acquire)
+                || !matches!(s.status(&project.id)?.as_str(), "running" | "pausing")
+            {
                 let _ = engine.stop().await;
                 return Err("interrupted".into());
             }
@@ -1658,7 +1763,7 @@ async fn analyze_position_timed(
                         break;
                     }
                     if let Some(parsed) = parse_line(&line, &task.fen, &task.moves) {
-                        if parsed.multipv <= project.multipv
+                        if parsed.multipv <= spec.multipv
                             && best
                                 .get(&parsed.multipv)
                                 .is_none_or(|old| old.depth <= parsed.depth)
@@ -1784,7 +1889,7 @@ async fn drive_debug_analysis(db: &Path, id: &str, max_results: u32) -> Result<S
                 break;
             }
         };
-        let outcome = match cached_for_project(&s, &project, &task) {
+        let outcome = match cached_for_project(&s, &task) {
             Ok(Some(lines)) => Ok((lines, None)),
             Ok(None) => analyze_position_timed(&project, &task, &s, &AtomicBool::new(false), None)
                 .await
@@ -1793,7 +1898,7 @@ async fn drive_debug_analysis(db: &Path, id: &str, max_results: u32) -> Result<S
         };
         match outcome {
             Ok((lines, Some(ms))) => {
-                s.save_cached(&task.id, &lines, ms, &project.engine)?;
+                s.save_cached(&task.id, &lines, ms, &s.task_execution(&task.id)?.engine)?;
                 completed += 1;
             }
             Ok((lines, None)) => {
@@ -1871,6 +1976,42 @@ pub fn show_debug_analysis(db: &Path, id: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     #[test]
+    fn analysis_store_uses_wal_for_concurrent_ui_reads_and_worker_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("analysis.sqlite")).unwrap();
+        let journal: String = store
+            .conn()
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(journal, "wal");
+    }
+
+    #[test]
+    fn app_store_does_not_rerun_migrations_for_each_ui_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("analysis.sqlite");
+        let cached = std::sync::Mutex::new(None);
+        let first = cached_store(&path, &cached).unwrap();
+        first
+            .create_project(
+                "Local",
+                "/opt/homebrew/bin/stockfish",
+                100,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        let lock = rusqlite::Connection::open(&path).unwrap();
+        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        // A second Store::open would retry schema writes and eventually fail under this lock.
+        let second = cached_store(&path, &cached).unwrap();
+        assert_eq!(second.path, path);
+        lock.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
     fn analysis_update_event_kinds_have_stable_ui_names() {
         assert_eq!(
             serde_json::to_string(&AnalysisChange::TreeNodeUpdated).unwrap(),
@@ -1898,6 +2039,11 @@ mod tests {
         assert_eq!(settings.analysis_time_ms, 750);
         assert_eq!(settings.engine_id, engine);
         assert_eq!(cycle, 0);
+        store.set_status(&project.id, "running").unwrap();
+        assert!(store.prepare_automatic_project(&project.id).is_err());
+        store.set_status(&project.id, "pausing").unwrap();
+        assert!(store.prepare_automatic_project(&project.id).is_err());
+        assert_eq!(store.automatic(&project.id).unwrap().unwrap().1, 0);
         assert!(store.prepare_automatic_project("missing-project").is_err());
     }
 
@@ -2229,6 +2375,310 @@ mod tests {
         assert_eq!(store.list_tasks(&project.id).unwrap()[0].id, task.id);
     }
     #[test]
+    fn legacy_pending_task_migrates_execution_requirements_once_without_losing_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE deep_projects(id TEXT PRIMARY KEY,title TEXT NOT NULL,engine TEXT NOT NULL,depth INTEGER NOT NULL DEFAULT 0,time_ms INTEGER NOT NULL,multipv INTEGER NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT (datetime('now')));
+            CREATE TABLE deep_tasks(id TEXT PRIMARY KEY,project_id TEXT NOT NULL,parent_task_id TEXT,fen TEXT NOT NULL,moves TEXT NOT NULL DEFAULT '[]',ply INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'queued',error TEXT);
+            CREATE TABLE deep_results(task_id TEXT NOT NULL,multipv INTEGER NOT NULL,depth INTEGER NOT NULL,score_kind TEXT NOT NULL,score_value INTEGER NOT NULL,score_perspective TEXT NOT NULL DEFAULT 'white',uci_moves TEXT NOT NULL,PRIMARY KEY(task_id,multipv));").unwrap();
+        let engine = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        conn.execute("INSERT INTO deep_projects(id,title,engine,time_ms,multipv,status) VALUES('legacy','old',?1,650,2,'paused')", [&engine]).unwrap();
+        conn.execute("INSERT INTO deep_tasks(id,project_id,fen,moves,ply) VALUES('legacy-task','legacy',?1,'[]',0)", [start_fen()]).unwrap();
+        drop(conn);
+        let migrated = Store::open(&path).unwrap();
+        let spec = migrated.task_execution("legacy-task").unwrap();
+        assert_eq!(
+            (spec.time_ms, spec.depth, spec.multipv, spec.operation),
+            (650, 12, 2, AnalysisOperation::TimeAndDepth)
+        );
+        assert_eq!(spec.engine, engine);
+        drop(migrated);
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(reopened.list_tasks("legacy").unwrap().len(), 1);
+        assert_eq!(reopened.task_execution("legacy-task").unwrap().time_ms, 650);
+        assert_eq!(
+            reopened
+                .conn()
+                .unwrap()
+                .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn fresh_task_schema_and_repeated_open_preserve_execution_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.sqlite");
+        let store = Store::open(&path).unwrap();
+        let project = store
+            .create_project(
+                "fresh",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                550,
+                3,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        let task = store.list_tasks(&project.id).unwrap().remove(0);
+        let original = store.task_execution(&task.id).unwrap();
+        assert_eq!((original.time_ms, original.multipv), (550, 3));
+        let conn = store.conn().unwrap();
+        let required: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('deep_tasks') WHERE name IN ('execution_engine','engine_profile','requested_multipv','requested_time_ms','requested_depth','operation_mode','cache_policy') AND \"notnull\"=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(required, 7);
+        let triggers: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='deep_task_execution_snapshot'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(triggers, 1);
+        drop(conn);
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(reopened.list_tasks(&project.id).unwrap().len(), 1);
+        let restored = reopened.task_execution(&task.id).unwrap();
+        assert_eq!(
+            (restored.time_ms, restored.multipv, restored.engine),
+            (original.time_ms, original.multipv, original.engine)
+        );
+        assert_eq!(
+            reopened
+                .conn()
+                .unwrap()
+                .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn queued_task_keeps_its_engine_profile_limits_operation_and_cache_policy_after_settings_change(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let s = Store::open(&path).unwrap();
+        let engine = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let p = s
+            .create_project("settings", &engine, 750, 2, &start_fen(), &[])
+            .unwrap();
+        let first = s.list_tasks(&p.id).unwrap().remove(0);
+        let original = s.task_execution(&first.id).unwrap();
+        assert_eq!(
+            (
+                original.engine.as_str(),
+                original.engine_profile.as_str(),
+                original.time_ms,
+                original.depth,
+                original.multipv
+            ),
+            (engine.as_str(), "default", 750, 12, 2)
+        );
+        assert_eq!(original.operation, AnalysisOperation::TimeAndDepth);
+        assert_eq!(original.cache_policy, "compatible_only");
+
+        let initial = scheduler::AnalysisSettings {
+            analysis_time_ms: 900,
+            analysis_depth: 19,
+            analysis_operation: AnalysisOperation::TimeOrDepth,
+            engine_id: engine.clone(),
+            ..Default::default()
+        };
+        s.enable_automatic(&p.id, &initial).unwrap();
+        let pending = s.queue_root(&p.id, "startpos", 0).unwrap();
+        let snapshot = s.task_execution(&pending.id).unwrap();
+        assert_eq!(
+            (
+                snapshot.time_ms,
+                snapshot.depth,
+                snapshot.operation,
+                snapshot.multipv
+            ),
+            (900, 19, AnalysisOperation::TimeOrDepth, 2)
+        );
+        assert_eq!(snapshot.engine, engine);
+        assert_eq!(snapshot.cache_policy, "compatible_only");
+        let changed = scheduler::AnalysisSettings {
+            analysis_time_ms: 250,
+            analysis_depth: 7,
+            analysis_operation: AnalysisOperation::Ungated,
+            engine_id: "another-engine".into(),
+            ..Default::default()
+        };
+        s.enable_automatic(&p.id, &changed).unwrap();
+        drop(s);
+        let reopened = Store::open(&path).unwrap();
+        let restored = reopened.task_execution(&pending.id).unwrap();
+        assert_eq!(
+            (
+                restored.time_ms,
+                restored.depth,
+                restored.operation,
+                restored.multipv
+            ),
+            (900, 19, AnalysisOperation::TimeOrDepth, 2)
+        );
+        assert_eq!(restored.engine, engine);
+        let view = reopened
+            .read_tasks(&p.id)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == pending.id)
+            .unwrap();
+        assert_eq!(
+            (
+                view.requested_time_ms,
+                view.requested_depth,
+                view.operation_mode.as_deref()
+            ),
+            (Some(900), Some(19), Some("time_or_depth"))
+        );
+        assert_eq!(
+            (
+                view.priority,
+                view.remaining_prolong_count,
+                view.source_node_id,
+                view.strategy.as_str(),
+                view.position_fen.as_str(),
+                view.engine_profile.as_str(),
+                view.requested_multipv,
+                view.cache_policy.as_str(),
+            ),
+            (
+                1,
+                0,
+                None,
+                "manual",
+                start_fen().as_str(),
+                "default",
+                2,
+                "compatible_only"
+            )
+        );
+    }
+
+    #[test]
+    fn finish_current_pause_preserves_running_task_queue_and_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db")).unwrap();
+        let p = s
+            .create_project(
+                "finish",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        let _next = s.queue_root(&p.id, "startpos", 0).unwrap();
+        let settings = scheduler::AnalysisSettings::default();
+        s.enable_automatic(&p.id, &settings).unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let current = s.claim(&p.id).unwrap().unwrap();
+        let before = s.automatic(&p.id).unwrap().unwrap();
+        let state = DeepAnalysisState::default();
+        let lease = state.acquire(&p.id).unwrap();
+        state.pause_after_current(&s, &p.id).unwrap();
+        state.pause_after_current(&s, &p.id).unwrap();
+        assert_eq!(s.status(&p.id).unwrap(), "pausing");
+        assert!(!lease.cancelled.load(Ordering::Acquire));
+        assert_eq!(
+            s.list_tasks(&p.id)
+                .unwrap()
+                .iter()
+                .find(|t| t.id == current.id)
+                .unwrap()
+                .status,
+            "running"
+        );
+        assert!(s.claim(&p.id).unwrap().is_none());
+        let line = DeepAnalysisLine {
+            multipv: 1,
+            depth: 12,
+            score_kind: "cp".into(),
+            score_value: 21,
+            score_perspective: "white".into(),
+            uci_moves: vec!["e2e4".into()],
+        };
+        s.snapshot(&current.id, &line).unwrap();
+        s.save(&current.id, &[line.clone()]).unwrap();
+        assert!(s.complete_pause_after_current(&p.id).unwrap());
+        assert_eq!(s.status(&p.id).unwrap(), "paused");
+        assert_eq!(
+            s.list_tasks(&p.id)
+                .unwrap()
+                .iter()
+                .filter(|t| t.status == "queued")
+                .count(),
+            1
+        );
+        assert_eq!(
+            s.list_tasks(&p.id)
+                .unwrap()
+                .iter()
+                .filter(|t| t.status == "completed")
+                .count(),
+            1
+        );
+        assert_eq!(s.results(&p.id).unwrap()[0].lines[0], line);
+        assert_eq!(s.automatic(&p.id).unwrap().unwrap().1, before.1);
+        drop(lease);
+    }
+
+    #[test]
+    fn recovery_of_pausing_project_is_safe_and_explicitly_resumable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let s = Store::open(&path).unwrap();
+        let p = s
+            .create_project(
+                "pausing",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                1000,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        let _next = s.queue_root(&p.id, "startpos", 0).unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let task = s.claim(&p.id).unwrap().unwrap();
+        let state = DeepAnalysisState::default();
+        let lease = state.acquire(&p.id).unwrap();
+        state.pause_after_current(&s, &p.id).unwrap();
+        assert_eq!(s.status(&p.id).unwrap(), "pausing");
+        drop(lease);
+        drop(s);
+        let reopened = Store::open(&path).unwrap();
+        reopened.recover().unwrap();
+        assert_eq!(reopened.status(&p.id).unwrap(), "paused");
+        assert_eq!(
+            reopened
+                .list_tasks(&p.id)
+                .unwrap()
+                .iter()
+                .filter(|t| t.status == "queued")
+                .count(),
+            2
+        );
+        assert_eq!(reopened.read_scheduler(&p.id).unwrap().active_task_id, None);
+        assert!(reopened.claim(&p.id).unwrap().is_none());
+        reopened.begin_running(&p.id, "paused").unwrap();
+        assert_eq!(reopened.claim(&p.id).unwrap().unwrap().id, task.id);
+        let tasks = reopened.list_tasks(&p.id).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_ne!(tasks[0].id, tasks[1].id);
+    }
+
+    #[test]
     fn recovery_requeues_inflight_and_pauses_project() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(&dir.path().join("db")).unwrap();
@@ -2470,6 +2920,78 @@ mod tests {
         assert_eq!(reopened.list_tasks(&p.id).unwrap()[0].status, "completed");
         assert_eq!(reopened.results(&p.id).unwrap()[0].lines[0].depth, 8);
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finish_current_pause_does_not_cancel_active_uci_search() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stopped = dir.path().join("stopped");
+        let engine = dir.path().join("finish.sh");
+        std::fs::write(&engine, format!("#!/bin/sh\nwhile read line; do\n case \"$line\" in\n uci) echo uciok;;\n isready) echo readyok;;\n go*) echo 'info depth 12 score cp 34 pv e2e4 e7e5';;\n stop) touch '{}'; echo 'bestmove e2e4';;\n quit) exit 0;;\n esac\ndone\n", stopped.display())).unwrap();
+        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.path().join("db");
+        let s = Store::open(&path).unwrap();
+        let p = s
+            .create_project(
+                "finish current",
+                engine.to_str().unwrap(),
+                400,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        s.queue_root(&p.id, "startpos", 0).unwrap();
+        s.begin_running(&p.id, "paused").unwrap();
+        let current = s.claim(&p.id).unwrap().unwrap();
+        let state = DeepAnalysisState::default();
+        let lease = state.acquire(&p.id).unwrap();
+        let other = Store::open(&path).unwrap();
+        let project = p.clone();
+        let task = current.clone();
+        let cancelled = lease.cancelled.clone();
+        let search =
+            tokio::spawn(
+                async move { analyze_position(&project, &task, &other, &cancelled).await },
+            );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while s.results(&p.id).unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        state.pause_after_current(&s, &p.id).unwrap();
+        assert_eq!(s.status(&p.id).unwrap(), "pausing");
+        assert!(
+            !stopped.exists(),
+            "pause must not stop the current search early"
+        );
+        let lines = search.await.unwrap().unwrap();
+        assert!(stopped.exists(), "normal completion should stop the engine");
+        s.save(&current.id, &lines).unwrap();
+        s.complete_pause_after_current(&p.id).unwrap();
+        assert_eq!(s.status(&p.id).unwrap(), "paused");
+        assert_eq!(
+            s.list_tasks(&p.id)
+                .unwrap()
+                .iter()
+                .filter(|t| t.status == "completed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            s.list_tasks(&p.id)
+                .unwrap()
+                .iter()
+                .filter(|t| t.status == "queued")
+                .count(),
+            1
+        );
+        assert!(s.claim(&p.id).unwrap().is_none());
+        drop(lease);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn pause_stops_search_preserves_snapshot_and_blocks_next_task() {
@@ -2763,6 +3285,17 @@ mod tests {
             .unwrap();
         let manual = s.manual_prolong(&p.id, first, 3).unwrap();
         assert_eq!(manual.status, "queued");
+        let original_spec = s.task_execution(&manual.id).unwrap();
+        s.enable_automatic(
+            &p.id,
+            &scheduler::AnalysisSettings {
+                analysis_time_ms: 250,
+                analysis_depth: 19,
+                analysis_operation: AnalysisOperation::TimeOrDepth,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         drop(s);
         let s = Store::open(&path).unwrap();
         assert_eq!(s.claim(&p.id).unwrap().unwrap().id, manual.id);
@@ -2783,6 +3316,27 @@ mod tests {
         )
         .unwrap();
         let two = s.claim(&p.id).unwrap().unwrap();
+        let child_spec = s.task_execution(&two.id).unwrap();
+        assert_eq!(
+            (
+                child_spec.engine,
+                child_spec.engine_profile,
+                child_spec.multipv,
+                child_spec.time_ms,
+                child_spec.depth,
+                child_spec.operation,
+                child_spec.cache_policy
+            ),
+            (
+                original_spec.engine.clone(),
+                original_spec.engine_profile.clone(),
+                original_spec.multipv,
+                original_spec.time_ms,
+                original_spec.depth,
+                original_spec.operation,
+                original_spec.cache_policy.clone()
+            )
+        );
         s.save(
             &two.id,
             &[parse_line("info depth 12 score cp 2 pv g1f3", &two.fen, &two.moves).unwrap()],
@@ -2972,8 +3526,20 @@ mod tests {
             ..Default::default()
         };
         s.enable_automatic(&p.id, &settings).unwrap();
+        let requested = s.queue_root(&p.id, "startpos", 0).unwrap();
+        s.enable_automatic(
+            &p.id,
+            &scheduler::AnalysisSettings {
+                analysis_operation: AnalysisOperation::TimeAndDepth,
+                analysis_time_ms: 1000,
+                analysis_depth: 20,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         s.begin_running(&p.id, "paused").unwrap();
         let task = s.claim(&p.id).unwrap().unwrap();
+        assert_eq!(task.id, requested.id);
         let result = tokio::time::timeout(
             Duration::from_millis(700),
             analyze_position(&p, &task, &s, &AtomicBool::new(false)),

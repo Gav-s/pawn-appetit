@@ -718,6 +718,14 @@ async startDeepAnalysis(projectId: string) : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async pauseAfterCurrentDeepAnalysis(projectId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pause_after_current_deep_analysis", { projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async pauseDeepAnalysis(projectId: string) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("pause_deep_analysis", { projectId }) };
@@ -784,7 +792,7 @@ export type AnalysisNodeView = { id: string; parentId: string | null; moveUci: s
  */
 export type AnalysisOptions = { fen: string; moves: string[]; annotateNovelties: boolean; referenceDb: string | null; reversed: boolean }
 export type AnalysisProjectSummary = { id: string; name: string; rootFen: string; schedulerState: string; currentStage: string | null; engine: string; createdAt: string; updatedAt: string | null; taskCounts: TaskCounts; analysedNodeCount: number }
-export type AnalysisTaskView = { id: string; strategy: string; priority: number; sourceNodeId: string | null; positionFen: string; state: string; requestedTimeMs: number | null; requestedDepth: number | null; operationMode: string | null; remainingProlongCount: number; engine: string; createdAt: string | null }
+export type AnalysisTaskView = { id: string; strategy: string; priority: number; sourceNodeId: string | null; positionFen: string; state: string; requestedTimeMs: number | null; requestedDepth: number | null; operationMode: string | null; remainingProlongCount: number; engine: string; engineProfile: string; requestedMultipv: number; cachePolicy: string; createdAt: string | null }
 export type AnalysisUpdate = { projectId: string; kind: AnalysisChange; taskId: string | null }
 /**
  * Best-move line from engine output, including PV, score, and stats.

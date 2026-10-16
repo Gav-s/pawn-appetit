@@ -6,6 +6,7 @@ import DeepAnalysisPage from "../DeepAnalysisPage";
 import type {
   AnalysisNodeView,
   AnalysisProjectSummary,
+  AnalysisTaskView,
   SchedulerView,
   DeepAnalysisProgress,
   AnalysisUpdate,
@@ -214,6 +215,10 @@ function fixture(persisted = false) {
       tasks = [{ ...task, status: "running" }];
       results = [{ taskId: "t1", lines: [line] }];
     }),
+    pauseAfterCurrent: vi.fn(async () => {
+      projects = [{ ...project, status: "paused" }];
+      tasks = [{ ...task, status: "queued" }];
+    }),
     pause: vi.fn(async () => {
       projects = [{ ...project, status: "paused" }];
       tasks = [{ ...task, status: "queued" }];
@@ -232,10 +237,13 @@ function fixture(persisted = false) {
 
 describe("Deep Analysis desktop workflow", () => {
   it("subscribes once, refreshes read models on an update, and unsubscribes on unmount", async () => {
+    // The 15-second fallback cannot fire here: only the backend event may refresh.
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     const service = fixture(true);
     await render(service);
     expect(service.updateListenerCount()).toBe(1);
     expect(service.onUpdate).toHaveBeenCalledTimes(1);
+    expect(service.getTree).toHaveBeenCalledTimes(1);
     const nextNode: AnalysisNodeView = {
       ...rootNode,
       id: "2",
@@ -249,6 +257,7 @@ describe("Deep Analysis desktop workflow", () => {
       service.emitUpdate({ projectId: "p1", kind: "tree_node_updated", taskId: "t1" }),
     );
     expect(host.textContent).toContain("e4");
+    expect(service.getTree).toHaveBeenCalledTimes(2);
     const view = root!;
     await act(async () =>
       view.render(
@@ -272,6 +281,7 @@ describe("Deep Analysis desktop workflow", () => {
       late({ projectId: "p1", kind: "tree_node_updated", taskId: "t1" });
     });
     expect(service.getTree).toHaveBeenCalledTimes(reads);
+    vi.useRealTimers();
   });
 
   it("refreshes scheduler stage and project controls from semantic updates", async () => {
@@ -521,6 +531,56 @@ describe("Deep Analysis desktop workflow", () => {
     expect(service.startAutomatic).not.toHaveBeenCalled();
   });
 
+  it("shows persisted per-task execution metadata when an event queues priority work", async () => {
+    const service = fixture(true);
+    await render(service);
+    const queued: AnalysisTaskView = {
+      id: "t-priority",
+      strategy: "Prolong",
+      priority: 1,
+      sourceNodeId: "147",
+      positionFen: FEN,
+      state: "queued",
+      requestedTimeMs: 900,
+      requestedDepth: 19,
+      operationMode: "time_or_depth",
+      remainingProlongCount: 2,
+      engine: "/usr/bin/stockfish",
+      engineProfile: "default",
+      requestedMultipv: 2,
+      cachePolicy: "compatible_only",
+      createdAt: null,
+    };
+    vi.mocked(service.getTaskViews).mockResolvedValue([queued]);
+    await act(async () =>
+      service.emitUpdate({ projectId: "p1", kind: "task_queued", taskId: queued.id }),
+    );
+    expect(host.textContent).toContain("Prolong · queued · Priority 1");
+    expect(host.textContent).toContain("900 ms · depth 19 · time_or_depth");
+    expect(host.textContent).toContain("Source 147 · 2 prolongs left");
+    expect(host.textContent).toContain("Profile default · MultiPV 2 · Cache compatible_only");
+  });
+
+  it("offers immediate pause separately and blocks a second scheduler during finish-current pause", async () => {
+    const service = fixture(true);
+    vi.mocked(service.listProjects).mockResolvedValueOnce([{ ...project, status: "running" }]);
+    await render(service);
+    await click("Pause immediately");
+    expect(service.pause).toHaveBeenCalledWith("p1");
+    expect(service.pauseAfterCurrent).not.toHaveBeenCalled();
+
+    vi.mocked(service.listProjects).mockResolvedValue([{ ...project, status: "pausing" }]);
+    await act(async () =>
+      service.emitUpdate({ projectId: "p1", kind: "project_state_changed", taskId: null }),
+    );
+    const start = [...host.querySelectorAll("button")].find(
+      (button) => button.textContent?.trim() === "Start analysis",
+    );
+    expect(start?.disabled).toBe(true);
+    expect(host.textContent).not.toContain("Pause immediately");
+    expect(host.textContent).not.toContain("Resume analysis");
+  });
+
   it("creates a named project with time/MultiPV and its root already persisted, then controls analysis", async () => {
     const service = fixture();
     await render(service);
@@ -546,7 +606,8 @@ describe("Deep Analysis desktop workflow", () => {
     expect(host.textContent).toContain("+0.37");
     expect(host.textContent).toContain("e2e4 e7e5");
     await click("Pause analysis");
-    expect(service.pause).toHaveBeenCalledWith("p1");
+    expect(service.pauseAfterCurrent).toHaveBeenCalledWith("p1");
+    expect(service.pause).not.toHaveBeenCalled();
     await click("Resume analysis");
     expect(service.resume).toHaveBeenCalledWith("p1");
   });

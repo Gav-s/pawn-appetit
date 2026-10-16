@@ -65,6 +65,7 @@ export interface DeepAnalysisService {
     ): Promise<DeepAnalysisProject>;
     queueRoot(projectId: string, fen: string): Promise<DeepAnalysisTask>;
     start(projectId: string): Promise<void>;
+    pauseAfterCurrent(projectId: string): Promise<void>;
     pause(projectId: string): Promise<void>;
     cancel(projectId: string): Promise<void>;
     resume(projectId: string): Promise<void>;
@@ -99,6 +100,9 @@ export const deepAnalysisService: DeepAnalysisService = {
     queueRoot: (projectId, fen) => unwrapCommand(commands.queueDeepAnalysisRoot(projectId, fen, 0)),
     start: async (projectId) => {
         await unwrapCommand(commands.startDeepAnalysis(projectId));
+    },
+    pauseAfterCurrent: async (projectId) => {
+        await unwrapCommand(commands.pauseAfterCurrentDeepAnalysis(projectId));
     },
     pause: async (projectId) => {
         await unwrapCommand(commands.pauseDeepAnalysis(projectId));

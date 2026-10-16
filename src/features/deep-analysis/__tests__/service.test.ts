@@ -11,6 +11,7 @@ vi.mock("@/bindings", () => ({
         queueDeepAnalysisRoot: vi.fn(),
         startDeepAnalysis: vi.fn(),
         pauseDeepAnalysis: vi.fn(),
+        pauseAfterCurrentDeepAnalysis: vi.fn(),
         cancelDeepAnalysis: vi.fn(),
         resumeDeepAnalysis: vi.fn(),
         listDeepAnalysisSummaries: vi.fn(),
@@ -117,6 +118,13 @@ describe("typed deep analysis command adapter", () => {
         expect(commands.startAutomaticDeepAnalysis).toHaveBeenCalledWith("p1");
         expect(commands.stopDeepAnalysis).toHaveBeenCalledWith("p1", false);
         expect(commands.manualProlongDeepAnalysis).toHaveBeenCalledWith("p1", "1", 2);
+    });
+
+    it("has a separate finish-current pause command", async () => {
+        vi.mocked(commands.pauseAfterCurrentDeepAnalysis).mockResolvedValue(ok(null) as never);
+        await deepAnalysisService.pauseAfterCurrent("p1");
+        expect(commands.pauseAfterCurrentDeepAnalysis).toHaveBeenCalledWith("p1");
+        expect(commands.pauseDeepAnalysis).not.toHaveBeenCalled();
     });
 
     it("subscribes to semantic analysis updates and unlistens on teardown", async () => {

@@ -32,8 +32,9 @@ use deep_analysis::{
     get_deep_analysis_scheduler, get_deep_analysis_summary, get_deep_analysis_task_views,
     get_deep_analysis_tree, list_deep_analysis_projects, list_deep_analysis_results,
     list_deep_analysis_summaries, list_deep_analysis_tasks, manual_prolong_deep_analysis,
-    pause_deep_analysis, queue_deep_analysis_continuation, queue_deep_analysis_root,
-    resume_deep_analysis, start_automatic_deep_analysis, start_deep_analysis, stop_deep_analysis,
+    pause_after_current_deep_analysis, pause_deep_analysis, queue_deep_analysis_continuation,
+    queue_deep_analysis_root, resume_deep_analysis, start_automatic_deep_analysis,
+    start_deep_analysis, stop_deep_analysis,
 };
 use deep_analysis::{AnalysisUpdate, DeepAnalysisProgress, DeepAnalysisState};
 use derivative::Derivative;
@@ -200,6 +201,7 @@ pub async fn run() {
             queue_deep_analysis_root,
             queue_deep_analysis_continuation,
             start_deep_analysis,
+            pause_after_current_deep_analysis,
             pause_deep_analysis,
             resume_deep_analysis,
             stop_deep_analysis,

@@ -85,6 +85,9 @@ pub struct AnalysisTaskView {
     pub operation_mode: Option<String>,
     pub remaining_prolong_count: u8,
     pub engine: String,
+    pub engine_profile: String,
+    pub requested_multipv: u16,
+    pub cache_policy: String,
     pub created_at: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Type)]
@@ -265,12 +268,9 @@ impl Store {
     }
 
     pub(super) fn read_tasks(&self, id: &str) -> Result<Vec<AnalysisTaskView>, String> {
-        let engine = self
-            .get_project(id)?
-            .ok_or("analysis project not found")?
-            .engine;
+        self.get_project(id)?.ok_or("analysis project not found")?;
         let conn = self.conn()?;
-        let mut query=conn.prepare("SELECT id,fen,status,strategy,priority,remaining_prolong,occurrence_id FROM deep_tasks WHERE project_id=?1 ORDER BY rowid").map_err(|e|e.to_string())?;
+        let mut query=conn.prepare("SELECT id,fen,status,strategy,priority,remaining_prolong,occurrence_id,execution_engine,engine_profile,requested_multipv,requested_time_ms,requested_depth,operation_mode,cache_policy FROM deep_tasks WHERE project_id=?1 ORDER BY rowid").map_err(|e|e.to_string())?;
         let views = query
             .query_map([id], |r| {
                 Ok(AnalysisTaskView {
@@ -281,10 +281,13 @@ impl Store {
                     priority: r.get(4)?,
                     remaining_prolong_count: r.get(5)?,
                     source_node_id: r.get::<_, Option<i64>>(6)?.map(|id| id.to_string()),
-                    requested_time_ms: None,
-                    requested_depth: None,
-                    operation_mode: None,
-                    engine: engine.clone(),
+                    engine: r.get(7)?,
+                    engine_profile: r.get(8)?,
+                    requested_multipv: r.get(9)?,
+                    requested_time_ms: Some(r.get(10)?),
+                    requested_depth: Some(r.get(11)?),
+                    operation_mode: Some(r.get(12)?),
+                    cache_policy: r.get(13)?,
                     created_at: None,
                 })
             })
@@ -477,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn project_task_and_scheduler_views_reopen_without_inventing_search_metadata() {
+    fn project_task_and_scheduler_views_reopen_with_requested_limits() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("analysis.sqlite");
         let store = Store::open(&path).unwrap();
@@ -503,7 +506,11 @@ mod tests {
         let priority = tasks.iter().find(|t| t.id == manual.id).unwrap();
         assert_eq!(priority.strategy, "manual");
         assert_eq!(priority.priority, 1);
-        assert_eq!(priority.requested_time_ms, None); // legacy intent is unknown, not inferred
+        assert_eq!(priority.requested_time_ms, Some(100));
+        assert_eq!(priority.requested_depth, Some(12));
+        assert_eq!(priority.operation_mode.as_deref(), Some("time_and_depth"));
+        assert_eq!(priority.engine_profile, "default");
+        assert_eq!(priority.cache_policy, "compatible_only");
         let scheduler = reopened.read_scheduler(&p.id).unwrap();
         assert!(serde_json::to_value(&scheduler).unwrap()["cycle"].is_string());
         assert_eq!(scheduler.cycle, "0");
