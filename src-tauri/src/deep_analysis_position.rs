@@ -223,6 +223,7 @@ pub(super) fn sufficient_task(
          JOIN deep_tasks accepted ON accepted.id=e.task_id
          JOIN deep_tasks wanted ON wanted.id=?2
          WHERE e.position_id=?1 AND accepted.status='completed'
+           AND wanted.moves='[]'
            AND e.context_key='fen_only' AND e.engine=wanted.execution_engine
            AND e.engine_profile=wanted.engine_profile
            AND e.multipv>=wanted.requested_multipv

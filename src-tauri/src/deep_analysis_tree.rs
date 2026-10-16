@@ -196,6 +196,100 @@ fn clear_untrusted_legacy_link(tx: &Transaction<'_>, task_id: &str) -> Result<()
     Ok(())
 }
 
+// Reused canonical results can supply a PV to a different occurrence. Materialize
+// each move beneath that occurrence, never transplanting the other path's nodes.
+pub(super) fn ensure_pv_child(
+    tx: &Transaction<'_>,
+    parent_id: i64,
+    move_uci: &str,
+    source_task_id: &str,
+) -> Result<i64, String> {
+    let (project_id, fen, history_json, ply): (String, String, String, u32) = tx
+        .query_row(
+            "SELECT project_id,fen,history,ply FROM deep_tree_nodes WHERE id=?1",
+            [parent_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    let mut board = super::position(&fen)?;
+    let uci = UciMove::from_ascii(move_uci.as_bytes()).map_err(|e| e.to_string())?;
+    let mv = uci.to_move(&board).map_err(|e| e.to_string())?;
+    board.play_unchecked(&mv);
+    let next_ply = ply
+        .checked_add(1)
+        .ok_or("analysis move exceeds maximum ply")?;
+    let next_fen = Fen::from_position(board, EnPassantMode::Legal).to_string();
+    let mut history: Vec<String> =
+        serde_json::from_str(&history_json).map_err(|e| e.to_string())?;
+    history.push(move_uci.to_owned());
+    tx.execute(
+        "INSERT INTO deep_tree_nodes(project_id,source_task_id,parent_id,move_uci,fen,history,ply)
+         VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(parent_id,move_uci) DO NOTHING",
+        params![
+            project_id,
+            source_task_id,
+            parent_id,
+            move_uci,
+            next_fen,
+            serde_json::to_string(&history).map_err(|e| e.to_string())?,
+            next_ply
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    let id: i64 = tx
+        .query_row(
+            "SELECT id FROM deep_tree_nodes WHERE parent_id=?1 AND move_uci=?2",
+            params![parent_id, move_uci],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    position_graph::link_node(tx, id)?;
+    recompute_ancestors(tx, id)?;
+    Ok(id)
+}
+
+pub(super) fn materialize_shared_pvs(
+    tx: &Transaction<'_>,
+    task_id: &str,
+    node_id: i64,
+) -> Result<(), String> {
+    let (project_id, position_id): (String, i64) = tx
+        .query_row(
+            "SELECT project_id,position_id FROM deep_tree_nodes WHERE id=?1",
+            [node_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    let task_position: Option<i64> = tx
+        .query_row(
+            "SELECT position_id FROM deep_tasks WHERE id=?1 AND project_id=?2",
+            params![task_id, project_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if task_position != Some(position_id) {
+        return Err("interested path points to a different canonical position".into());
+    }
+    let lines = {
+        let mut stmt = tx
+            .prepare("SELECT uci_moves FROM deep_results WHERE task_id=?1 ORDER BY multipv")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([task_id], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        rows
+    };
+    for line in lines {
+        let mut parent = node_id;
+        for mv in serde_json::from_str::<Vec<String>>(&line).map_err(|e| e.to_string())? {
+            parent = ensure_pv_child(tx, parent, &mv, task_id)?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn resolve_occurrence(
     conn: &Connection,
     project_id: &str,
@@ -203,6 +297,7 @@ pub(super) fn resolve_occurrence(
     fen: &str,
     ply: u32,
     requested_id: Option<i64>,
+    requesting_task_id: Option<&str>,
 ) -> Result<i64, String> {
     let parent_history: String = conn
         .query_row(
@@ -216,7 +311,7 @@ pub(super) fn resolve_occurrence(
         serde_json::from_str(&parent_history).map_err(|e| e.to_string())?;
     let pvs: Vec<Vec<String>> = {
         let mut query = conn
-            .prepare("SELECT uci_moves FROM deep_results WHERE task_id=?1")
+            .prepare("SELECT uci_moves FROM deep_results WHERE task_id=?1 ORDER BY multipv")
             .map_err(|e| e.to_string())?;
         let pvs = query
             .query_map([parent_task_id], |row| row.get::<_, String>(0))
@@ -260,6 +355,30 @@ pub(super) fn resolve_occurrence(
     match matches.as_slice() {
         [id] => Ok(*id),
         [] if requested_id.is_some() => {
+            // A Prolong interest may attach a shared search to a different history.
+            // Only accept the exact materialized edge from an interested occurrence
+            // of this parent search; ordinary explicit continuations remain strict.
+            let id = requested_id.unwrap();
+            let edge: Option<(String, String)> = conn.query_row(
+                "SELECT n.history,n.move_uci FROM deep_tree_nodes n
+                 JOIN deep_tree_nodes parent ON parent.id=n.parent_id
+                 JOIN deep_tasks task ON task.id=?2 AND task.position_id=parent.position_id
+                 JOIN deep_task_interests incoming ON incoming.task_id=task.id AND incoming.node_id=parent.id
+                 LEFT JOIN deep_task_interests outgoing ON outgoing.task_id=?6
+                    AND outgoing.node_id=n.id AND outgoing.reason='Prolong'
+                 WHERE n.id=?1 AND n.project_id=?3 AND n.fen=?4 AND n.ply=?5
+                   AND (outgoing.task_id IS NOT NULL OR (?6 IS NULL AND n.source_task_id=task.id))",
+                params![id, parent_task_id, project_id, fen, ply, requesting_task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ).optional().map_err(|e| e.to_string())?;
+            if let Some((history, mv)) = edge {
+                let history: Vec<String> =
+                    serde_json::from_str(&history).map_err(|e| e.to_string())?;
+                if history.last() == Some(&mv) && pvs.first().and_then(|pv| pv.first()) == Some(&mv)
+                {
+                    return Ok(id);
+                }
+            }
             Err("requested occurrence does not follow the named parent PV".into())
         }
         [] => Err("completed parent has no matching tree occurrence on its PV".into()),
@@ -307,6 +426,7 @@ pub(super) fn store_completed(
             &root_fen,
             ply,
             occurrence_id,
+            Some(task_id),
         )?;
         tx.execute(
             "UPDATE deep_tree_nodes SET analyzed_task_id=COALESCE(analyzed_task_id,?2) WHERE id=?1",
@@ -419,6 +539,21 @@ pub(super) fn store_completed(
                 .map_err(|e| e.to_string())?;
             position_graph::link_node(tx, parent_id)?;
         }
+    }
+    // An accepted search can have several interested move occurrences. Replicate
+    // its legal PV edges beneath every path, retaining distinct node IDs/history.
+    let interested = {
+        let mut stmt = tx.prepare("SELECT DISTINCT node_id FROM deep_task_interests WHERE task_id=?1 AND node_id!=?2 ORDER BY node_id")
+            .map_err(|e| e.to_string())?;
+        let ids = stmt
+            .query_map(params![task_id, root_id], |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        ids
+    };
+    for interested_id in interested {
+        materialize_shared_pvs(tx, task_id, interested_id)?;
     }
     if let Some(position_id) =
         position_graph::record_accepted(tx, task_id, root_id, lines, elapsed_ms)?

@@ -97,12 +97,12 @@ pub(super) fn migrate_graph(conn: &mut Connection) -> Result<(), String> {
          JOIN deep_tree_nodes n ON n.project_id=t.project_id AND (
             n.id=t.occurrence_id OR (t.occurrence_id IS NULL AND n.source_task_id=t.id AND n.parent_id IS NULL));",
     ).map_err(|e|e.to_string())?;
-    type Key = (String, i64, String, String, u16, u32, u32, String);
+    type Key = (String, i64, String, String, u16, u32, u32, String, String);
     let pending = {
         let mut stmt = tx
             .prepare(
                 "SELECT id,project_id,position_id,execution_engine,engine_profile,
-            requested_multipv,requested_time_ms,requested_depth,operation_mode,status
+            requested_multipv,requested_time_ms,requested_depth,operation_mode,moves,status
             FROM deep_tasks WHERE status IN ('queued','running') AND position_id IS NOT NULL
             ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END,rowid",
             )
@@ -120,8 +120,9 @@ pub(super) fn migrate_graph(conn: &mut Connection) -> Result<(), String> {
                         r.get::<_, u32>(6)?,
                         r.get::<_, u32>(7)?,
                         r.get::<_, String>(8)?,
+                        r.get::<_, String>(9)?,
                     ),
-                    r.get::<_, String>(9)?,
+                    r.get::<_, String>(10)?,
                 ))
             })
             .map_err(|e| e.to_string())?
@@ -151,7 +152,7 @@ pub(super) fn migrate_graph(conn: &mut Connection) -> Result<(), String> {
     tx.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS deep_tasks_one_equivalent_pending
         ON deep_tasks(project_id,position_id,execution_engine,engine_profile,
-            requested_multipv,requested_time_ms,requested_depth,operation_mode)
+            requested_multipv,requested_time_ms,requested_depth,operation_mode,moves)
         WHERE position_id IS NOT NULL AND status IN ('queued','running');
         PRAGMA user_version=6;",
     )
@@ -216,5 +217,326 @@ impl Store {
             operation,
             cache_policy,
         })
+    }
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use crate::deep_analysis::{position_after, start_fen, Store};
+    use shakmaty::{fen::Fen, EnPassantMode};
+
+    #[test]
+    fn legacy_result_replay_installs_interests_schema_before_rebuilding_tree() {
+        use crate::deep_analysis::parse_line;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-replay.sqlite");
+        let store = Store::open(&path).unwrap();
+        let project = store
+            .create_project(
+                "legacy replay",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                100,
+                1,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        store.begin_running(&project.id, "paused").unwrap();
+        let root = store.claim(&project.id).unwrap().unwrap();
+        store
+            .save(
+                &root.id,
+                &[parse_line("info depth 12 score cp 30 pv e2e4", &root.fen, &[]).unwrap()],
+            )
+            .unwrap();
+        let conn = store.conn().unwrap();
+        conn.execute(
+            "DELETE FROM deep_tree_analyses WHERE task_id=?1",
+            [&root.id],
+        )
+        .unwrap();
+        conn.execute_batch("DROP TABLE deep_task_interests")
+            .unwrap();
+        drop(conn);
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        let conn = reopened.conn().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM deep_tree_analyses WHERE task_id=?1",
+                [&root.id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM deep_tree_backfill_deferred WHERE task_id=?1",
+                [&root.id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn shared_completed_search_materializes_legal_pv_under_every_interested_path() {
+        use crate::deep_analysis::parse_line;
+        use rusqlite::params;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("shared-pvs.sqlite")).unwrap();
+        let project = store
+            .create_project(
+                "shared PV",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                100,
+                2,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        store.begin_running(&project.id, "paused").unwrap();
+        let root = store.claim(&project.id).unwrap().unwrap();
+        let paths = ["g1f3 g8f6 b1c3 b8c6", "b1c3 b8c6 g1f3 g8f6"];
+        store
+            .save(
+                &root.id,
+                &paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        parse_line(
+                            &format!("info depth 12 multipv {} score cp 20 pv {p}", i + 1),
+                            &root.fen,
+                            &[],
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let conn = store.conn().unwrap();
+        let ids: Vec<i64> = paths
+            .iter()
+            .map(|p| {
+                conn.query_row(
+                    "SELECT id FROM deep_tree_nodes WHERE project_id=?1 AND history=?2",
+                    params![
+                        project.id,
+                        serde_json::to_string(&p.split_whitespace().collect::<Vec<_>>()).unwrap()
+                    ],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            })
+            .collect();
+        drop(conn);
+        let fen = Fen::from_position(
+            position_after(
+                &root.fen,
+                &paths[0]
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let first = store
+            .queue_at_occurrence(&project.id, &root.id, &fen, 4, ids[0])
+            .unwrap();
+        assert_eq!(
+            store
+                .queue_at_occurrence(&project.id, &root.id, &fen, 4, ids[1])
+                .unwrap()
+                .id,
+            first.id
+        );
+        store.claim(&project.id).unwrap();
+        store
+            .save(
+                &first.id,
+                &[parse_line("info depth 14 score cp 42 pv e2e4 e7e5", &fen, &[]).unwrap()],
+            )
+            .unwrap();
+        let conn = store.conn().unwrap();
+        for parent in ids {
+            let child:(String,i64)=conn.query_row("SELECT history,position_id FROM deep_tree_nodes WHERE parent_id=?1 AND move_uci='e2e4'",[parent],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert!(child.0.contains("e2e4"));
+            assert!(child.1 > 0);
+            assert_eq!(conn.query_row("SELECT count(*) FROM deep_tree_nodes WHERE parent_id IN (SELECT id FROM deep_tree_nodes WHERE parent_id=?1 AND move_uci='e2e4') AND move_uci='e7e5'",[parent],|r|r.get::<_,i64>(0)).unwrap(),1);
+        }
+    }
+
+    #[test]
+    fn later_accepted_reuse_materializes_pv_on_new_path_without_new_search() {
+        use crate::deep_analysis::parse_line;
+        use rusqlite::params;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("later-pvs.sqlite")).unwrap();
+        let project = store
+            .create_project(
+                "later PV",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                100,
+                2,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        store.begin_running(&project.id, "paused").unwrap();
+        let root = store.claim(&project.id).unwrap().unwrap();
+        let paths = ["g1f3 g8f6 b1c3 b8c6", "b1c3 b8c6 g1f3 g8f6"];
+        store
+            .save(
+                &root.id,
+                &paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        parse_line(
+                            &format!("info depth 12 multipv {} score cp 20 pv {p}", i + 1),
+                            &root.fen,
+                            &[],
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let conn = store.conn().unwrap();
+        let ids: Vec<i64> = paths
+            .iter()
+            .map(|p| {
+                conn.query_row(
+                    "SELECT id FROM deep_tree_nodes WHERE project_id=?1 AND history=?2",
+                    params![
+                        project.id,
+                        serde_json::to_string(&p.split_whitespace().collect::<Vec<_>>()).unwrap()
+                    ],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            })
+            .collect();
+        drop(conn);
+        let fen = Fen::from_position(
+            position_after(
+                &root.fen,
+                &paths[0]
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let first = store
+            .queue_at_occurrence(&project.id, &root.id, &fen, 4, ids[0])
+            .unwrap();
+        store.claim(&project.id).unwrap();
+        store
+            .save_cached(
+                &first.id,
+                &[
+                    parse_line(
+                        "info depth 16 multipv 1 score cp 42 pv e2e4 e7e5",
+                        &fen,
+                        &[],
+                    )
+                    .unwrap(),
+                    parse_line(
+                        "info depth 16 multipv 2 score cp 30 pv d2d4 d7d5",
+                        &fen,
+                        &[],
+                    )
+                    .unwrap(),
+                ],
+                200,
+                &project.engine,
+            )
+            .unwrap();
+        let shared = store
+            .queue_at_occurrence(&project.id, &root.id, &fen, 4, ids[1])
+            .unwrap();
+        assert_eq!(first.id, shared.id);
+        assert_eq!(shared.status, "completed");
+        let conn = store.conn().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM deep_tree_nodes WHERE parent_id=?1 AND move_uci='e2e4'",
+                [ids[1]],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(store.list_tasks(&project.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn scheduler_rejects_an_engine_that_would_mix_incompatible_minimax_scores() {
+        use crate::deep_analysis::scheduler::AnalysisSettings;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("engine-profile.sqlite")).unwrap();
+        let engine = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let project = store
+            .create_project("single engine", &engine, 100, 1, &start_fen(), &[])
+            .unwrap();
+        let changed = AnalysisSettings {
+            engine_id: "different-engine".into(),
+            ..Default::default()
+        };
+        assert!(store.enable_automatic(&project.id, &changed).is_err());
+        assert!(store.automatic(&project.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn migration_keeps_history_scoped_and_fen_only_pending_searches_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("context.sqlite");
+        let store = Store::open(&path).unwrap();
+        let start = start_fen();
+        let project = store
+            .create_project(
+                "history",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                100,
+                1,
+                &start,
+                &["e2e4".to_owned()],
+            )
+            .unwrap();
+        let original = store.list_tasks(&project.id).unwrap().remove(0);
+        assert_eq!(original.moves, vec!["e2e4"]);
+        let fen = Fen::from_position(
+            position_after(&start, &original.moves).unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let independent = store.queue_root(&project.id, &fen, 1).unwrap();
+        assert_ne!(
+            independent.id, original.id,
+            "FEN-only and history-scoped searches cannot coalesce"
+        );
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        let pending = reopened.list_tasks(&project.id).unwrap();
+        assert_eq!(pending.iter().filter(|t| t.status == "queued").count(), 2);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            2
+        );
     }
 }
