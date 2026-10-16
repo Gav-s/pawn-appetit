@@ -481,6 +481,204 @@ mod tests {
         assert_eq!((before, after, missing), (1, 1, 2));
     }
 
+    #[tokio::test]
+    #[ignore = "requires PAWN_STOCKFISH_BIN; deliberately runs the local UCI engine"]
+    async fn real_stockfish_shares_transposed_paths_and_resumes_after_reopen() {
+        use crate::deep_analysis::{
+            analyze_position_timed, parse_line, resume_debug_analysis, scheduler,
+        };
+        use std::sync::atomic::AtomicBool;
+        let engine = std::env::var("PAWN_STOCKFISH_BIN")
+            .expect("set PAWN_STOCKFISH_BIN to the local Stockfish executable");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stockfish-transposition.sqlite");
+        let store = Store::open(&path).unwrap();
+        let project = store
+            .create_project(
+                "stockfish-transposition",
+                &engine,
+                100,
+                2,
+                &start_fen(),
+                &[],
+            )
+            .unwrap();
+        store.begin_running(&project.id, "paused").unwrap();
+        let root = store.claim(&project.id).unwrap().unwrap();
+        let paths = ["g1f3 g8f6 b1c3 b8c6", "b1c3 b8c6 g1f3 g8f6"];
+        let seeded = paths
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                parse_line(
+                    &format!("info depth 12 multipv {} score cp 0 pv {path}", i + 1),
+                    &root.fen,
+                    &[],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        store.save(&root.id, &seeded).unwrap();
+        let fen = Fen::from_position(
+            position_after(
+                &root.fen,
+                &paths[0]
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        let tree = store.read_tree(&project.id).unwrap();
+        let leaves: Vec<_> = tree.iter().filter(|n| n.fen == fen).collect();
+        assert_eq!(leaves.len(), 2);
+        assert_ne!(leaves[0].id, leaves[1].id);
+        assert_eq!(leaves[0].position_id, leaves[1].position_id);
+        let first = store
+            .queue_at_occurrence(
+                &project.id,
+                &root.id,
+                &fen,
+                4,
+                leaves[0].id.parse().unwrap(),
+            )
+            .unwrap();
+        let shared = store
+            .queue_at_occurrence(
+                &project.id,
+                &root.id,
+                &fen,
+                4,
+                leaves[1].id.parse().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            first.id, shared.id,
+            "equivalent move paths must queue one search"
+        );
+        assert_eq!(
+            store
+                .list_tasks(&project.id)
+                .unwrap()
+                .iter()
+                .filter(|t| t.status == "queued")
+                .count(),
+            1
+        );
+        let claimed = store.claim(&project.id).unwrap().unwrap();
+        assert_eq!(claimed.id, first.id);
+        let (lines, elapsed) =
+            analyze_position_timed(&project, &claimed, &store, &AtomicBool::new(false), None)
+                .await
+                .unwrap();
+        store
+            .save_cached(&claimed.id, &lines, elapsed, &engine)
+            .unwrap();
+        let initial_depth = lines.iter().map(|l| l.depth).min().unwrap();
+        let views = store.read_tree(&project.id).unwrap();
+        assert!(views.iter().filter(|n|n.position_id==leaves[0].position_id && n.depth==Some(initial_depth)).count()>=2);
+        let mut settings = scheduler::AnalysisSettings::default();
+        settings.engine_id = engine.clone();
+        settings.analysis_time_ms = u32::try_from(elapsed).unwrap().saturating_add(150);
+        settings.analysis_depth = initial_depth.saturating_add(1);
+        store.enable_automatic(&project.id, &settings).unwrap();
+        let deeper = store
+            .queue_at_occurrence(
+                &project.id,
+                &root.id,
+                &fen,
+                4,
+                leaves[1].id.parse().unwrap(),
+            )
+            .unwrap();
+        assert_ne!(
+            deeper.id, first.id,
+            "insufficient accepted quality must queue a stronger search"
+        );
+        let second = store.claim(&project.id).unwrap().unwrap();
+        assert_eq!(second.id, deeper.id);
+        let (deeper_lines, deeper_elapsed) =
+            analyze_position_timed(&project, &second, &store, &AtomicBool::new(false), None)
+                .await
+                .unwrap();
+        store
+            .save_cached(&second.id, &deeper_lines, deeper_elapsed, &engine)
+            .unwrap();
+        let deeper_depth = deeper_lines.iter().map(|l| l.depth).min().unwrap();
+        assert!(
+            deeper_depth > initial_depth,
+            "the stronger request must deliver deeper analysis"
+        );
+        let views = store.read_tree(&project.id).unwrap();
+        for leaf in &leaves {
+            let view = views.iter().find(|n| n.id == leaf.id).unwrap();
+            assert_eq!(
+                view.depth,
+                Some(deeper_depth),
+                "each path must show the deeper shared result"
+            );
+            assert_eq!(
+                view.raw_evaluation,
+                views
+                    .iter()
+                    .find(|n| n.id == leaves[0].id)
+                    .unwrap()
+                    .raw_evaluation
+            );
+        }
+        let conn = store.conn().unwrap();
+        let (accepted,pending,interests):(i64,i64,i64)=conn.query_row("SELECT
+            (SELECT count(*) FROM deep_position_evaluations WHERE position_id=?1),
+            (SELECT count(*) FROM deep_tasks WHERE position_id=?1 AND status IN ('queued','running')),
+            (SELECT count(DISTINCT node_id) FROM deep_task_interests WHERE task_id=?2)",
+            params![leaves[0].position_id.parse::<i64>().unwrap(),first.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!((accepted, pending, interests), (2, 0, 2));
+        println!("stockfish transposition: project={} position={} paths={}/{} equivalent_searches=1 total_position_searches={} pending={} interested_paths={} first_depth={} deeper_depth={} first_ms={} deeper_ms={}",
+            project.id,leaves[0].position_id,leaves[0].id,leaves[1].id,accepted,pending,interests,initial_depth,deeper_depth,elapsed,deeper_elapsed);
+        drop(conn);
+        let distinct_fen = start_fen().replace(" w ", " b ");
+        let waiting = store.queue_root(&project.id, &distinct_fen, 0).unwrap();
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        reopened.recover().unwrap();
+        assert_eq!(reopened.status(&project.id).unwrap(), "paused");
+        assert_eq!(
+            reopened
+                .list_tasks(&project.id)
+                .unwrap()
+                .iter()
+                .find(|t| t.id == waiting.id)
+                .unwrap()
+                .status,
+            "queued"
+        );
+        assert_eq!(
+            reopened
+                .read_tree(&project.id)
+                .unwrap()
+                .iter()
+                .filter(|n| n.position_id == leaves[0].position_id)
+                .count(),
+            2
+        );
+        drop(reopened);
+        let resumed = resume_debug_analysis(&path, &project.id, 1).await.unwrap();
+        assert!(resumed.contains("status=paused"));
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .list_tasks(&project.id)
+                .unwrap()
+                .iter()
+                .find(|t| t.id == waiting.id)
+                .unwrap()
+                .status,
+            "completed"
+        );
+    }
+
     #[test]
     fn hash_collision_does_not_merge_different_canonical_positions() {
         let dir = tempfile::tempdir().unwrap();
