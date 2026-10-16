@@ -4,4 +4,4 @@ These notes describe externally observable chess-analysis behaviour for comparis
 
 Do not copy ChessOK/Aquarium Delphi code, disassembly, binary layouts, resources, engine bundles, database files or proprietary formats into this repository. Do not commit the Aquarium executable or extracted artifacts. Unknown historic behavior (notably `insert_best`, mate-index treatment, persistence and pause details) is not silently guessed: choose and test a safe independent behavior instead.
 
-Current implementation and its remaining limits: `docs/analysis-engine.md`.
+Current implementation and its remaining limits: `docs/analysis-engine.md`. Transposition-aware shared position storage is a deliberate clean-room improvement; this documentation does not claim to reproduce Aquarium's unknown transposition internals.
