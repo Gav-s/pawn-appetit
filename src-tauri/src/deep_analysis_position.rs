@@ -580,10 +580,12 @@ mod tests {
         let initial_depth = lines.iter().map(|l| l.depth).min().unwrap();
         let views = store.read_tree(&project.id).unwrap();
         assert!(views.iter().filter(|n|n.position_id==leaves[0].position_id && n.depth==Some(initial_depth)).count()>=2);
-        let mut settings = scheduler::AnalysisSettings::default();
-        settings.engine_id = engine.clone();
-        settings.analysis_time_ms = u32::try_from(elapsed).unwrap().saturating_add(150);
-        settings.analysis_depth = initial_depth.saturating_add(1);
+        let settings = scheduler::AnalysisSettings {
+            engine_id: engine.clone(),
+            analysis_time_ms: u32::try_from(elapsed).unwrap().saturating_add(150),
+            analysis_depth: initial_depth.saturating_add(1),
+            ..Default::default()
+        };
         store.enable_automatic(&project.id, &settings).unwrap();
         let deeper = store
             .queue_at_occurrence(
